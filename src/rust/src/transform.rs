@@ -90,7 +90,7 @@ pub fn transform(body: &[u8], cfg: &TransformConfig) -> (Vec<u8>, TransformInfo)
 
                 let mut doc = String::new();
                 if !desc.is_empty() {
-                    doc.push_str(&format!("### Tool: {}\n{}", name, desc));
+                    doc.push_str(&format!("#### Tool: {}\n{}\n", name, desc));
                     if desc.len() > 80 {
                         obj.insert("description".to_string(),
                                    json!(format!("See `{}` docs in system context image.", name)));
@@ -120,7 +120,7 @@ pub fn transform(body: &[u8], cfg: &TransformConfig) -> (Vec<u8>, TransformInfo)
             }
             if !tool_docs.is_empty() {
                 let tool_section = format!(
-                    "\n\n# Tool Documentation\n\n{}",
+                    "\n\n#### Tool Documentation\n\n{}",
                     tool_docs.join("\n\n")
                 );
                 info.tool_text_added = tool_section.len();
@@ -262,14 +262,18 @@ pub fn transform(body: &[u8], cfg: &TransformConfig) -> (Vec<u8>, TransformInfo)
         }
     }
 
-    // Replace system field: keep just the per-turn billing header line as text
-    // if present (so Anthropic still receives the auth/billing context); else
-    // leave whatever non-text remainder we extracted in place.
+    // Replace system field ONLY if we stripped a billing header — otherwise leave
+    // the original system field unchanged so Anthropic still has guardrails. This
+    // matches proxy.py's default PLACEMENT="user" behavior (proxy.py:417 comment
+    // "leave system unchanged so Anthropic still has guardrails"). The image
+    // content lives in messages[].content as a side-channel; system stays as
+    // original text. The duplicate "cost" is reclaimed on subsequent turns by
+    // the image's cache_control:ephemeral:1h tag and Anthropic's prompt cache.
     if let Some(billing) = billing_line {
         req.as_object_mut().unwrap().insert("system".to_string(), Value::String(billing));
-    } else if let Some(rem) = remainder {
-        req.as_object_mut().unwrap().insert("system".to_string(), rem);
     }
+    let _ = remainder; // intentionally unused — see comment above
+
 
     info.compressed = true;
     let new_body = serde_json::to_vec(&req).unwrap_or_else(|_| body.to_vec());
