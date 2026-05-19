@@ -170,30 +170,33 @@ function baselineCost(
   return actualEff + extraText * baselineRate;
 }
 
-/** One sample for the empirical cost regression. Built from cold-miss
- *  events (cache_read=0, cache_create>1000) where the new instrumentation
- *  (`image_pixels`, `outgoing_text_chars`) is present.
+/** One sample for the empirical cost regression. Built from any compressed
+ *  request where the full usage triple + new instrumentation (`image_pixels`,
+ *  `outgoing_text_chars`) is present. Cache state is NOT a gate — Anthropic's
+ *  tokenizer is deterministic on input bytes, so warm hits carry the same
+ *  body-token information as cold misses; only the billing differs.
  *
  *  Solves: `tokens ≈ α · text_chars + β · pixels` over N samples via 2×2
- *  normal equations. Surfaced live in `/proxy-stats` so the dashboard
- *  shows the empirical chars/token and tokens/image numbers as soon as
- *  enough cold-miss data accumulates — replaces the one-shot script that
- *  nobody would ever remember to run. */
-interface ColdMissSample {
+ *  normal equations, where `tokens = input + cache_create + cache_read`.
+ *  Surfaced live in `/proxy-stats` so the dashboard shows the empirical
+ *  chars/token and tokens/image numbers as soon as enough variance
+ *  accumulates — replaces the one-shot script that nobody would ever
+ *  remember to run. */
+interface FitSample {
   tokens: number;
   text_chars: number;
   pixels: number;
 }
 
-/** Cap for the cold-miss ring. Fits get noisier with more old data after a
+/** Cap for the fit-sample ring. Fits get noisier with more old data after a
  *  model change, so we keep it short — enough samples for a stable fit
  *  (N≥10 typical) but young enough that a flipped MULTI_COL or model upgrade
  *  flushes through within a few sessions. */
-const COLD_MISS_CAP = 50;
+const FIT_SAMPLE_CAP = 50;
 
 export class DashboardState {
   private recent: RecentRow[] = [];
-  private coldMisses: ColdMissSample[] = [];
+  private fitSamples: FitSample[] = [];
   private totals: Totals = {
     requests: 0,
     compressedRequests: 0,
@@ -302,33 +305,49 @@ export class DashboardState {
     this.recent.push(row);
     if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
 
-    // Cold-miss sample for the empirical cost regression. Requires the new
-    // pair of measurements (image_pixels + outgoing_text_chars) to be
-    // present, and the usage numbers to show a true cold miss (cache_read=0,
-    // cache_create>1000 — the latter filters out tiny no-system requests).
+    // Sample for the empirical cost regression. Anthropic's tokenizer is
+    // deterministic on input bytes — cache state changes BILLING (cache_read
+    // is discounted), not token count. The total token count of the full
+    // body is `input + cache_create + cache_read` regardless of how it was
+    // split across cached/uncached portions, so any request with the full
+    // usage triple + our new (image_pixels, outgoing_text_chars) pair is a
+    // valid (LHS, design-row) for solving `tokens ≈ α·text_chars + β·pixels`.
+    //
+    // (Earlier this code required `cache_read === 0` — a "true cold miss".
+    // That was wrong: it locked the fit out of normal traffic because warm
+    // hits are the steady state. The OLS solver's collinearity guard catches
+    // degenerate samples where pixels/text_chars don't vary, so relaxing
+    // here can't produce a garbage fit — it just produces null until we
+    // accumulate enough variance.)
+    //
+    // The 1000-token floor filters out trivial no-system requests where the
+    // tokenizer overhead dominates the body cost.
     const pixels = (info as { imagePixels?: number } | undefined)?.imagePixels;
     const textChars = (info as { outgoingTextChars?: number } | undefined)?.outgoingTextChars;
+    const totalTokens = haveUsage ? inp + cc + cr : 0;
     if (
       compressed &&
       haveUsage &&
-      cr === 0 &&
-      cc > 1000 &&
+      totalTokens > 1000 &&
       typeof pixels === 'number' &&
       pixels > 0 &&
       typeof textChars === 'number' &&
       textChars > 0
     ) {
-      this.coldMisses.push({ tokens: inp + cc, text_chars: textChars, pixels });
-      if (this.coldMisses.length > COLD_MISS_CAP) {
-        this.coldMisses.splice(0, this.coldMisses.length - COLD_MISS_CAP);
+      this.fitSamples.push({ tokens: totalTokens, text_chars: textChars, pixels });
+      if (this.fitSamples.length > FIT_SAMPLE_CAP) {
+        this.fitSamples.splice(0, this.fitSamples.length - FIT_SAMPLE_CAP);
       }
     }
   }
 
-  /** Solve the empirical cost regression over the current cold-miss ring.
+  /** Solve the empirical cost regression over the current fit-sample ring.
    *  Returns `null` until we have at least 3 samples — fewer leaves the
    *  2×2 normal equations under-determined and the fit jumps around with
-   *  every new event, which would be worse than just showing nothing. */
+   *  every new event, which would be worse than just showing nothing.
+   *  Also returns null on collinear samples (e.g., a single Claude Code
+   *  session sending warm hits keeps `pixels` constant, so we can't
+   *  separate α and β until cross-session variance lands). */
   fitCosts(): {
     alpha: number;
     beta: number;
@@ -338,7 +357,7 @@ export class DashboardState {
     multicol2_tokens_per_img: number;
     n: number;
   } | null {
-    const samples = this.coldMisses;
+    const samples = this.fitSamples;
     if (samples.length < 3) return null;
     let sxx = 0;
     let sxy = 0;
