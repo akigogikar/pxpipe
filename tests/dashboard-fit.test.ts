@@ -101,10 +101,38 @@ describe('DashboardState.fitCosts() — empirical α/β regression', () => {
 
   it('returns null when text_chars column is constant', () => {
     // Mirror case — same body shape across samples, only cache state varies.
-    // Without text variance, α is unidentifiable.
+    // Without text variance, α is unidentifiable in EITHER joint or
+    // constrained mode (constrained still needs text to vary).
     dash.update(ev({ textChars: 130_000, pixels: 21_000_000, input: 5, cacheCreate: 500, cacheRead: 141_680 }));
     dash.update(ev({ textChars: 130_000, pixels: 23_000_000, input: 5, cacheCreate: 300, cacheRead: 142_447 }));
     dash.update(ev({ textChars: 130_000, pixels: 25_000_000, input: 5, cacheCreate: 200, cacheRead: 143_119 }));
+    expect(dash.fitCosts()).toBeNull();
+  });
+
+  it('constrained-mode CV threshold (2%) accommodates real single-session text variance', () => {
+    // Live single-session-warm-cache traffic from 2026-05-19: three turns
+    // hit the proxy with text chars 117,927 / 127,512 / 128,588 and the
+    // SAME cached image (pixels constant at 22,792,816). Text CV = 3.84%.
+    // Under the original joint-mode-only 5% gate this returned null and the
+    // dashboard fell back to wandering stale constants. The split-threshold
+    // version activates constrained mode here (β pinned, α measured) so
+    // the operator gets a measured-α answer instead of stale constants.
+    dash.update(ev({ textChars: 117_927, pixels: 22_792_816, input: 6, cacheCreate: 1116, cacheRead: 124_236 }));
+    dash.update(ev({ textChars: 127_512, pixels: 22_792_816, input: 476, cacheCreate: 6103, cacheRead: 125_352 }));
+    dash.update(ev({ textChars: 128_588, pixels: 22_792_816, input: 1, cacheCreate: 2432, cacheRead: 131_455 }));
+    const fit = dash.fitCosts();
+    expect(fit).not.toBeNull();
+    expect(fit!.mode).toBe('constrained');
+    expect(fit!.alpha).toBeGreaterThan(0);
+  });
+
+  it('still rejects below the 2% floor (literally-identical-text case)', () => {
+    // Below 2% text CV the residual signal is too thin to measure α even
+    // with β pinned. Make sure we still return null instead of producing a
+    // garbage 1-D fit.
+    dash.update(ev({ textChars: 130_000, pixels: 22_792_816, input: 6, cacheCreate: 1116, cacheRead: 124_236 }));
+    dash.update(ev({ textChars: 130_500, pixels: 22_792_816, input: 6, cacheCreate: 1116, cacheRead: 124_236 }));
+    dash.update(ev({ textChars: 130_800, pixels: 22_792_816, input: 6, cacheCreate: 1116, cacheRead: 124_236 }));
     expect(dash.fitCosts()).toBeNull();
   });
 

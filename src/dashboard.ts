@@ -418,7 +418,17 @@ export class DashboardState {
     const varP = Math.max(0, syy / n - meanP * meanP);
     const cvX = meanX > 0 ? Math.sqrt(varX) / meanX : 0;
     const cvP = meanP > 0 ? Math.sqrt(varP) / meanP : 0;
-    const MIN_CV = 0.05;
+    // Joint mode threshold: 5% on BOTH columns. Below that, OLS can't tell
+    // whether token cost is coming from text or pixels and the α/β split
+    // wanders ±15 pp per sample (HANDOFF "What's blocking calibration").
+    const MIN_CV_JOINT = 0.05;
+    // Constrained mode threshold: 2% on TEXT only. β is pinned (no split
+    // to disambiguate), so we're fitting one parameter through the origin.
+    // 1-D OLS is numerically stable at much lower variance — typical live
+    // single-session traffic has 3-4% text CV (verified 2026-05-19 live:
+    // 117k/127k/128k chars over three turns = 3.84% CV). The 2% floor
+    // still rejects "literally identical text three times in a row".
+    const MIN_CV_CONSTRAINED = 0.02;
 
     // Anthropic's published per-pixel rate for the default image tiling:
     // 1 token per ~750 pixels (≈ 0.001333). Used by the constrained fallback
@@ -427,7 +437,7 @@ export class DashboardState {
     const ANTHROPIC_BETA = 1 / 750;
 
     // ---- Mode 1: joint OLS (both columns vary) ----
-    if (cvX >= MIN_CV && cvP >= MIN_CV) {
+    if (cvX >= MIN_CV_JOINT && cvP >= MIN_CV_JOINT) {
       const det = sxx * syy - sxy * sxy;
       if (det !== 0) {
         const alpha = (syy * sxt - sxy * syt) / det;
@@ -462,7 +472,7 @@ export class DashboardState {
     //
     // (derivation: minimize Σ(α·x − r)² → dL/dα = 0 → α = Σxr / Σx²
     //  where r_i = tokens_i − β · pixels_i, so Σx·r = sxt − β·sxy.)
-    if (cvX < MIN_CV || sxx === 0) return null;
+    if (cvX < MIN_CV_CONSTRAINED || sxx === 0) return null;
     const alphaConstrained = (sxt - ANTHROPIC_BETA * sxy) / sxx;
     if (alphaConstrained <= 0) return null;
     return {
