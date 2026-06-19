@@ -67,9 +67,12 @@ export function isPxpipeSupportedModel(model: string | null | undefined): boolea
   return allowedModelBases().some((b) => base === b || base.startsWith(`${b}-`));
 }
 
-/** GPT image-tokenization validated only for GPT 5.5 family; widen after production telemetry confirms safety. */
+/** GPT-5 family (gpt-5, gpt-5.5, gpt-5.6, *-mini/-nano). Default-on: image OCR is
+ *  validated for the 5.x family; older GPT-4.x vision is intentionally not enabled here. */
+const GPT5_FAMILY = /^gpt-5(?:\.\d+)?(?:-|$)/;
 export function isPxpipeSupportedGptModel(model: string | null | undefined): boolean {
-  return typeof model === 'string' && /^gpt-5\.5(?:-|$)/.test(model);
+  if (typeof model !== 'string') return false;
+  return GPT5_FAMILY.test(baseModelId(model));
 }
 
 export function shouldTransformAnthropicMessages(

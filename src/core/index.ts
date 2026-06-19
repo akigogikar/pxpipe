@@ -29,7 +29,7 @@ export {
   type KeepSharpBlock,
   type RecoverableBlock,
 } from './transform.js';
-export { transformOpenAIChatCompletions } from './openai.js';
+export { transformOpenAIChatCompletions, transformOpenAIResponses, resolveVisionCost, openAIVisionTokens } from './openai.js';
 export { createProxy, type ProxyConfig, type ProxyEvent } from './proxy.js';
 export {
   computeActualInputEff,

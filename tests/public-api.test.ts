@@ -74,11 +74,18 @@ describe('public library API', () => {
     }
   });
 
-  it('recognizes only the GPT 5.5 family for OpenAI chat support', () => {
+  it('recognizes the full GPT-5 family for OpenAI chat support', () => {
+    expect(isPxpipeSupportedGptModel('gpt-5')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-5.5-codex')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-5.5-2026-06-01')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.1')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5-mini')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-nano')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6[1m]')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-4o')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-50')).toBe(false);
+    expect(isPxpipeSupportedGptModel('')).toBe(false);
     expect(isPxpipeSupportedGptModel('claude-opus-4-8')).toBe(false);
     expect(isPxpipeSupportedGptModel(null)).toBe(false);
   });

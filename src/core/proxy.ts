@@ -4,7 +4,7 @@
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
-import { transformOpenAIChatCompletions } from './openai.js';
+import { transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
@@ -583,6 +583,7 @@ export function createProxy(config: ProxyConfig = {}) {
     // Transform only known shapes; everything else passes through.
     const isMessages = req.method === 'POST' && url.pathname === '/v1/messages';
     const isOpenAIChat = req.method === 'POST' && url.pathname === '/v1/chat/completions';
+    const isOpenAIResponses = req.method === 'POST' && url.pathname === '/v1/responses';
     const isModelsPath = url.pathname === '/v1/models' || url.pathname.startsWith('/v1/models/');
     const looksOpenAIAuth =
       config.openAIApiKey !== undefined
@@ -605,7 +606,7 @@ export function createProxy(config: ProxyConfig = {}) {
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
 
-    if (isMessages || isOpenAIChat) {
+    if (isMessages || isOpenAIChat || isOpenAIResponses) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
       try {
         const transformOpts =
@@ -615,15 +616,12 @@ export function createProxy(config: ProxyConfig = {}) {
         const modelOk = isMessages
           ? isPxpipeSupportedModel(model)
           : isPxpipeSupportedGptModel(model);
+        const effectiveOpts = modelOk ? transformOpts : { ...transformOpts, compress: false };
         const r = isMessages
-          ? await transformRequest(
-            bodyIn,
-            modelOk ? transformOpts : { ...transformOpts, compress: false },
-          )
-          : await transformOpenAIChatCompletions(
-            bodyIn,
-            modelOk ? transformOpts : { ...transformOpts, compress: false },
-          );
+          ? await transformRequest(bodyIn, effectiveOpts)
+          : isOpenAIChat
+            ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
+            : await transformOpenAIResponses(bodyIn, effectiveOpts);
         if (!modelOk) r.info.reason = 'unsupported_model';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
