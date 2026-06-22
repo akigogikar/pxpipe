@@ -570,6 +570,7 @@ export interface TransformInfo {
     | 'below_min_chars'
     | 'below_min_tokens'
     | 'not_profitable'
+    | 'too_many_images'
     | 'render_empty'
     | 'collapsed';
   /** Token count of the pre-compression body from /v1/messages/count_tokens (free).

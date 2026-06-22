@@ -409,6 +409,9 @@ describe('transformOpenAIResponses — history collapse', () => {
       );
     });
     expect(historyItems).toHaveLength(1);
+    const historyIdx = out.input.indexOf(historyItems[0]!);
+    expect((out.input[historyIdx + 1] as { role?: string }).role).toBe('developer');
+    expect(JSON.stringify(out.input[historyIdx + 1])).toContain('live current request');
     const serialized = JSON.stringify(out.input);
     expect(serialized).not.toContain(OPENING_PROMPT_MARKER);
     expect(serialized).toContain(LIVE_PROMPT_MARKER);
@@ -446,6 +449,31 @@ describe('transformOpenAIResponses — history collapse', () => {
     expect(result.info.historyReason).not.toBe('collapsed');
     expect(result.info.collapsedImages ?? 0).toBe(0);
   });
+
+  it('partially collapses GPT history up to the image cap and leaves the rest as text', async () => {
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6',
+      instructions: BIG_SLAB,
+      input: buildResponsesInput(30),
+    }));
+    const result = await transformOpenAIResponses(body, {
+      charsPerToken: 1,
+      minCompressChars: 1,
+      gptHistory: { collapseChunk: 0, sectionTokens: 100, maxImages: 2 },
+    });
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.historyReason).toBe('collapsed');
+    expect(result.info.collapsedImages ?? 0).toBeGreaterThan(0);
+    expect(result.info.collapsedImages ?? 0).toBeLessThanOrEqual(2);
+
+    const out = JSON.parse(dec.decode(result.body)) as { input: Array<Record<string, unknown>> };
+    const serialized = JSON.stringify(out.input);
+    // Oldest prefix became a bounded history-image item, while later history and
+    // the current prompt remain plain text after the cap.
+    expect(serialized).toContain('attribute every turn strictly by its tag');
+    expect(serialized).toContain('Continue with 28');
+    expect(serialized).toContain(LIVE_PROMPT_MARKER);
+  });
 });
 
 describe('transformOpenAIChatCompletions — history collapse', () => {
@@ -469,6 +497,9 @@ describe('transformOpenAIChatCompletions — history collapse', () => {
       );
     });
     expect(historyMsgs).toHaveLength(1);
+    const historyIdx = out.messages.indexOf(historyMsgs[0]!);
+    expect((out.messages[historyIdx + 1] as { role?: string }).role).toBe('developer');
+    expect(JSON.stringify(out.messages[historyIdx + 1])).toContain('live current request');
     const serialized = JSON.stringify(out.messages);
     expect(serialized).not.toContain(OPENING_PROMPT_MARKER);
     expect(serialized).toContain(LIVE_PROMPT_MARKER);

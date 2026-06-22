@@ -660,9 +660,18 @@ export class DashboardState {
       // it was cold for BOTH paths. Pricing the text counterfactual warm on a
       // cr=0 turn invents a discount we never observed and turns genuine token
       // wins (image < text at the same cold create rate) into phantom losses.
-      // So warmth follows the observed read, not the wall clock alone.
-      const warm =
-        cr > 0 && warmthPrev !== undefined && nowSec - warmthPrev.ts < DashboardState.CACHE_TTL_SEC;
+      // So warmth follows the OBSERVED read ALONE — not our in-memory warmth
+      // map, which a restart/eviction wipes and which can't see a session that
+      // was already warm before this process booted. (A cr>0 turn priced cold
+      // because warmthPrev was missing would bill text the 1.25× create on a
+      // prefix we KNOW was cached — fabricating the inflated "99% saved" row.)
+      // The map only refines the reused-vs-grown split; with no fresh prior we
+      // assume the cached prefix was fully reused (prevCacheable = cacheable →
+      // no fabricated growth) rather than mispricing a known-warm read.
+      const warm = cr > 0;
+      const warmFresh =
+        warmthPrev !== undefined && nowSec - warmthPrev.ts < DashboardState.CACHE_TTL_SEC;
+      const prevCacheable = warm ? (warmFresh ? warmthPrev!.cacheable : cacheable) : 0;
       baselineInputEff = creditSaving
         ? computeBaselineInputEff(
             baseline as number,
@@ -671,7 +680,7 @@ export class DashboardState {
             cc,
             cr,
             warm,
-            warm ? warmthPrev!.cacheable : 0,
+            prevCacheable,
           )
         : actualInputEff;
       // Record this turn's warmth footprint for the next turn in this session.
@@ -957,9 +966,13 @@ export class DashboardState {
           typeof sidR === 'string' && sidR.length > 0 ? this.baselineWarmth.get(sidR) : undefined;
         // Same cr-grounded warmth as update() — see the note there. cr>0 ⇒ the
         // imaged prefix read a warm cache, so the text counterfactual would have
-        // too; cr===0 ⇒ cold for both, price text cold (never warm-vs-cold).
-        const warmR =
-          cr > 0 && warmthPrevR !== undefined && tsSec - warmthPrevR.ts < DashboardState.CACHE_TTL_SEC;
+        // too; cr===0 ⇒ cold for both, price text cold (never warm-vs-cold). The
+        // persisted-ts map only refines the reused-vs-grown split; with no fresh
+        // prior we assume full reuse rather than mispricing a known-warm read.
+        const warmR = cr > 0;
+        const warmFreshR =
+          warmthPrevR !== undefined && tsSec - warmthPrevR.ts < DashboardState.CACHE_TTL_SEC;
+        const prevCacheableR = warmR ? (warmFreshR ? warmthPrevR!.cacheable : cacheable) : 0;
         baselineInputEff = creditSaving
           ? computeBaselineInputEff(
               baseline as number,
@@ -968,7 +981,7 @@ export class DashboardState {
               cc,
               cr,
               warmR,
-              warmR ? warmthPrevR!.cacheable : 0,
+              prevCacheableR,
             )
           : actualInputEff;
         if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {

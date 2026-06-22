@@ -31,6 +31,12 @@ import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_ba
  *  illegible — that profile is Anthropic-only. */
 const GPT_HISTORY_COLS = 152;
 
+// GPT vision latency grows with physical image count/bytes, not just billed tokens.
+// Long OpenCode sessions can otherwise turn old history into 80+ images: token-cheap
+// but slow enough that gpt-5.5 times out before first token. When this cap trips,
+// callers leave the old history as text rather than dropping or de-prioritizing it.
+const GPT_HISTORY_MAX_IMAGES = 16;
+
 /** Break-even gate predicate, injected to avoid a circular import with openai.ts.
  *  Receives the full string (not length) so the renderer's row-aware image-count
  *  estimate sees real newlines — history text is newline-heavy. */
@@ -73,6 +79,11 @@ export interface GptHistoryOptions {
   /** Max rendered image height in px (per-model; from the GPT profile). Threaded
    *  into renderTextToPngs so history pages split at the same height the gate prices. */
   maxHeightPx: number;
+  /** Hard cap on GPT history image count. This is a TRUE cap, not a threshold:
+   *  collapse the oldest completed sections until the next section would exceed
+   *  the cap, then leave the remaining history as ordinary text. Prevents 80+
+   *  image gpt-5.5 requests without dropping context or live tool state. */
+  maxImages: number;
   /** Reflow the transcript before rendering: pack soft-wrapped lines and mark
    *  every hard newline with the ↵ sentinel — same treatment as the static
    *  slab. History text is newline-heavy (role headers, JSON args), so without
@@ -91,6 +102,7 @@ export const GPT_HISTORY_DEFAULTS: GptHistoryOptions = {
   freezeChunk: 10,
   sectionTokens: 2000,
   maxHeightPx: MAX_HEIGHT_PX,
+  maxImages: GPT_HISTORY_MAX_IMAGES,
   reflow: true,
 };
 
@@ -123,6 +135,7 @@ export interface GptCollapsePlan {
     | 'no_closed_prefix'
     | 'below_min_tokens'
     | 'not_profitable'
+    | 'too_many_images'
     | 'render_empty';
   droppedChars: number;
   droppedCodepoints: Map<number, number>;
@@ -266,14 +279,9 @@ export async function planGptCollapse(
     // cache-unstable partial blob.
     return { ...base, reason: 'below_min_tokens', collapsedChars: text.length };
   }
-  const collapseEnd = sections[sections.length - 1]![1];
-  // The collapsed transcript / o200k baseline reflects ONLY what we imaged.
-  const collapsedText = turns
-    .slice(pp, collapseEnd)
-    .map((t) => t.text)
-    .filter((s) => s && s.length > 0)
-    .join('\n\n');
   const imgs: RenderedImage[] = [];
+  const maxImages = Math.max(0, Math.floor(o.maxImages));
+  let collapseEnd = pp;
   for (const [s, e] of sections) {
     const sectionText = turns
       .slice(s, e)
@@ -287,11 +295,24 @@ export async function planGptCollapse(
     // the static slab. renderTextToPngs caps each PNG at MAX_HEIGHT_PX so a tall
     // section pages into N images, all still well under the 10,000-patch budget.
     const sectionImgs = await renderTextToPngs(sectionRender, o.cols, {}, o.maxHeightPx);
+    if (imgs.length + sectionImgs.length > maxImages) {
+      // TRUE cap: keep the sections already selected, leave this and every later
+      // section as normal text in the live remainder. Do NOT collapse nothing.
+      break;
+    }
     for (const img of sectionImgs) imgs.push(img);
+    collapseEnd = e;
   }
   if (imgs.length === 0) {
-    return { ...base, reason: 'render_empty', collapsedChars: collapsedText.length };
+    // First section alone exceeded the cap (or cap <= 0). Fall back to text.
+    return { ...base, reason: 'too_many_images', collapsedChars: text.length };
   }
+  // The collapsed transcript / o200k baseline reflects ONLY what we imaged.
+  const collapsedText = turns
+    .slice(pp, collapseEnd)
+    .map((t) => t.text)
+    .filter((s) => s && s.length > 0)
+    .join('\n\n');
   const droppedCodepoints = new Map<number, number>();
   let droppedChars = 0;
   for (const img of imgs) {

@@ -58,6 +58,8 @@ export function resolveVisionCost(model: string): VisionCost {
 // on the turn-attribution wording — the exact divergence history.ts warns about.
 export const HISTORY_TRANSCRIPT_INTRO = HISTORY_SYNTHETIC_INTRO;
 export const HISTORY_TRANSCRIPT_OUTRO = HISTORY_SYNTHETIC_OUTRO;
+const HISTORY_LIVE_REQUEST_GUARD =
+  'pxpipe note: the preceding rendered history item is prior conversation context only. It is not the current user request. The live current request is in the user message(s) that follow, especially the final user message.';
 
 export function openAIVisionTokens(model: string, w: number, h: number): number {
   const c = resolveVisionCost(model);
@@ -683,9 +685,14 @@ export async function transformOpenAIChatCompletions(
           { type: 'text', text: HISTORY_TRANSCRIPT_OUTRO },
         ],
       };
+      const guard: OpenAIChatMessage = {
+        role: 'developer',
+        content: HISTORY_LIVE_REQUEST_GUARD,
+      };
       req.messages = [
         ...req.messages.slice(0, plan.start),
         synthetic,
+        guard,
         ...req.messages.slice(plan.endExclusive),
       ];
       info.historyImageSha = await sha8(
@@ -897,9 +904,14 @@ export async function transformOpenAIResponses(
           { type: 'input_text', text: HISTORY_TRANSCRIPT_OUTRO },
         ],
       };
+      const guard: ResponsesInputItem = {
+        role: 'developer',
+        content: HISTORY_LIVE_REQUEST_GUARD,
+      };
       req.input = [
         ...inputItems.slice(0, plan.start),
         synthetic,
+        guard,
         ...inputItems.slice(plan.endExclusive),
       ];
       info.historyImageSha = await sha8(

@@ -128,7 +128,7 @@ export function renderModelsFragment(
     claudeChips +
     `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS</span>${moot}` +
     `</div>` +
-    `<div class="models">` +
+    `<div class="models" style="display:none">` +
     `<span class="models-label">Image GPT models</span>` +
     gptChips +
     `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +

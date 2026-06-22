@@ -112,6 +112,20 @@ describe('planGptCollapse — gates', () => {
     expect(plan.text.length).toBe(plan.collapsedChars);
   });
 
+  it('caps GPT history collapse by partially collapsing oldest sections', async () => {
+    const turns = plainTurns(80, 1000);
+    const plan = await planGptCollapse(turns, 0, yes, {
+      collapseChunk: 0,
+      sectionTokens: 100,
+      maxImages: 2,
+    });
+    expect(plan.reason).toBeUndefined();
+    expect(plan.images.length).toBeGreaterThan(0);
+    expect(plan.images.length).toBeLessThanOrEqual(2);
+    expect(plan.collapsedChars).toBeGreaterThan(0);
+    expect(plan.endExclusive).toBeLessThan(80 - GPT_HISTORY_DEFAULTS.keepTail);
+  });
+
   it('protects the leading prefix (slab-bearing first item)', async () => {
     const turns = plainTurns(40, 1000);
     const plan = await planGptCollapse(turns, 3, yes);

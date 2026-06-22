@@ -348,6 +348,7 @@ describe('cr-grounded warmth (cold-miss is priced cold, never a phantom loss)', 
       cache_read_input_tokens: number;
     },
     cacheable: number,
+    sid = 'warmsess',
   ): unknown {
     return {
       ts: '2026-05-19T00:00:00Z',
@@ -359,7 +360,7 @@ describe('cr-grounded warmth (cold-miss is priced cold, never a phantom loss)', 
       usage,
       info: {
         compressed: true,
-        firstUserSha8: 'warmsess',
+        firstUserSha8: sid,
         baselineProbeStatus: 'ok',
         baselineTokens: 30000, // text counterfactual: full prefix + tail
         baselineCacheableTokens: cacheable, // prefix up to the cache_control marker
@@ -446,5 +447,42 @@ describe('cr-grounded warmth (cold-miss is priced cold, never a phantom loss)', 
     // warm baseline: 20000×0.1 (reused) + 2000×1.25 (grown) + 8000 tail = 12500.
     expect(warm.baseline_input).toBe(12500);
     expect(warm.session_saved_so_far_delta).toBe(7900);
+  });
+
+  it('prices a warm read warm even with NO prior warmth state (post-restart)', async () => {
+    // The cache is already warm on Anthropic's side (cr>0), but this process has
+    // never seen the session — exactly the first turn after a pxpipe restart, a
+    // >5min idle (TTL eviction), or a SESSION_CAP eviction. The OLD code required
+    // an in-memory warmthPrev entry, so it fell through to the COLD branch and
+    // billed the known-cached prefix the 1.25× CREATE rate — fabricating the
+    // inflated "99% saved" row the operator reported. cr>0 is direct proof the
+    // prefix was cached, so it must be priced as a warm READ.
+    dash.update(
+      antEvt(
+        {
+          input_tokens: 100,
+          output_tokens: 50,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 20000, // warm read on the FIRST turn we see
+        },
+        20000,
+        'restartsess', // never primed in this process
+      ) as never,
+    );
+
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    expect(row.cache_read).toBe(20000);
+
+    // actual = 100 + 20000×0.1 = 2100 (we paid the warm read rate).
+    expect(row.actual_input).toBe(2100);
+
+    // Warm baseline with full prefix reuse (no prior ⇒ prevCacheable = cacheable):
+    // 20000×0.1 (reused) + 0 (grown) + 10000 tail = 12000. NOT the cold
+    // 20000×1.25 + 10000 = 35000 the old code produced (which would have shown a
+    // 32900-token / ~94% "saved" against a 2100-token actual — the inflated row).
+    expect(row.baseline_input).toBe(12000);
+    expect(row.baseline_input).not.toBe(35000); // the inflated cold-priced bug value
+    expect(row.session_saved_so_far_delta).toBe(9900);
   });
 });
