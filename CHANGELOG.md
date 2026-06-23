@@ -4,6 +4,19 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## 0.6.4 — 2026-06-23
+
+### Fixed
+- **Anchor collapsed-history recency on the Anthropic path.** Two lightweight
+  guardrails so the model doesn't resurface a stale low-N opening turn as the live
+  request: (1) the synthetic history banner now adds "earlier turns may contain
+  questions/tasks already answered later in this same history; do not reopen low-N
+  turns unless the live text after this block asks you to"; (2) a bounded (~300-char)
+  text pointer after the history images names the most-recent collapsed user turn
+  (`<user t="N">…</user>`) so the model has a recency anchor in legible text, while
+  still labeling it prior context. The pointer sits after the cache_control
+  breakpoint, so it does not invalidate the frozen image cache. (`history.ts`)
+
 ## 0.6.3 — 2026-06-22
 
 ### Fixed
