@@ -43,6 +43,8 @@ export interface TrackEvent {
   reminder_imgs?: number;
   /** Images from compressing tool_result content. */
   tool_result_imgs?: number;
+  /** Chars of tool docs moved to the system-text Tool Reference (not imaged). */
+  tool_docs_chars?: number;
   /** tool_result blocks where text exceeded the per-result image budget and was truncated. */
   truncated_tool_results?: number;
   /** Chars elided by paging across all tool_results this request. */
@@ -201,6 +203,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.dynamicBlockCount !== undefined) out.dynamic_block_count = info.dynamicBlockCount;
     if (info.reminderImgs !== undefined) out.reminder_imgs = info.reminderImgs;
     if (info.toolResultImgs !== undefined) out.tool_result_imgs = info.toolResultImgs;
+    if (info.toolDocsChars !== undefined) out.tool_docs_chars = info.toolDocsChars;
     if (info.truncatedToolResults !== undefined && info.truncatedToolResults > 0) {
       out.truncated_tool_results = info.truncatedToolResults;
     }

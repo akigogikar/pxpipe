@@ -695,16 +695,16 @@ describe('transform', () => {
     }
   });
 
-  it('folds tool docs into the same image and stubs originals', async () => {
+  it('moves tool docs to a system-text Tool Reference and stubs originals', async () => {
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
-      system: 'short',
+      // Tool docs no longer feed the image slab, so the static system text
+      // alone must clear the compression gate.
+      system: 'x'.repeat(150000),
       tools: [
         {
           name: 'BigTool',
-          // Long enough to push the combined slab past the 2-image break-even
-          // (20k chars). 'A very long tool description. ' = 30 chars × 1100 = 33k.
           description: 'A very long tool description. '.repeat(5000),
           input_schema: { type: 'object', properties: { x: { type: 'string' } } },
         },
@@ -713,10 +713,32 @@ describe('transform', () => {
     const bytes = new TextEncoder().encode(req);
     const { body, info } = await transformRequest(bytes);
     expect(info.compressed).toBe(true);
+    expect(info.toolDocsChars).toBeGreaterThan(0);
 
     const out = JSON.parse(new TextDecoder().decode(body));
-    expect(out.tools[0].description).toContain('See image');
+    // Stub cites its own heading in the system Tool Reference (link-up contract).
     expect(out.tools[0].name).toBe('BigTool');
+    expect(out.tools[0].description).toContain('"## Tool: BigTool"');
+    expect(out.tools[0].description).toContain('Tool Reference');
+    // Full docs land as plain text in the system field, under that exact heading.
+    const sysTexts = (out.system as any[])
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text as string);
+    const ref = sysTexts.find((t) => t.includes('=== TOOL REFERENCE ==='));
+    expect(ref).toBeDefined();
+    expect(ref!).toContain('## Tool: BigTool');
+    expect(ref!).toContain('A very long tool description.');
+    // And the imaged slab no longer carries the tool docs.
+    expect(info.imageSourceText ?? '').not.toContain('A very long tool description.');
+    // Classifier regression (169521c; retripped 2026-07-02 by a stub citing "the
+    // system prompt"): pxpipe-authored framing must never read as a replayed or
+    // extracted prompt. Ban the trigger wording in the stub and the reference
+    // header, and require first-party provenance framing on the reference block.
+    // Scoped to the header only — quoted tool docs below it are third-party text.
+    expect(out.tools[0].description).not.toMatch(/system prompt|authoritative/i);
+    const refHeader = ref!.slice(0, ref!.indexOf('## Tool:'));
+    expect(refHeader).not.toMatch(/system prompt|authoritative/i);
+    expect(refHeader).toContain("this user's local proxy");
   });
 
   it('preserves input_schema structure (properties / required / enum) when compressing', async () => {
@@ -725,7 +747,7 @@ describe('transform', () => {
     // when the model tried to actually invoke a tool. The fix preserves the
     // schema SHELL (type, properties keys, required, enum, items) and only
     // strips long-form `description` / `title` / `$schema` / `default` /
-    // `examples`. The image still carries the original schema for the model.
+    // `examples`. The system-text Tool Reference still carries the original schema.
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],

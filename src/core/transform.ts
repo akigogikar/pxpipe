@@ -536,6 +536,8 @@ export interface TransformInfo {
   imageSourceText?: string;
   reminderImgs?: number;
   toolResultImgs?: number;
+  /** Chars of tool docs moved to the system-text Tool Reference (not imaged). */
+  toolDocsChars?: number;
   /** Codepoints missing from the atlas (rendered as blank cells). Telemetry for atlas tuning. */
   droppedChars?: number;
   /** Top dropped codepoints by frequency (`U+HHHH` → count), at most 20 entries. */
@@ -1437,7 +1439,12 @@ export async function transformRequest(
   if (claudeMdSha) info.claudeMdSha8 = claudeMdSha;
   if (firstUserSha) info.firstUserSha8 = firstUserSha;
 
-  // 2. Optionally fold tool docs into the same image, stubbing originals.
+  // 2. Optionally move tool docs to a plain-text "Tool Reference" section in the
+  //    system field, stubbing originals. Text (not image) because tool docs are
+  //    static per session — they sit inside the cached prefix and cost ~0.1× after
+  //    the first turn, while keeping schemas/param docs losslessly readable.
+  //    Each stub description cites its own heading ("## Tool: <name>") so the
+  //    model can link stub → full doc deterministically.
   let toolDocsText = '';
   let toolsRewritten: ToolDef[] | undefined;
   if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
@@ -1471,7 +1478,13 @@ export async function transformRequest(
       }
       return {
         ...t,
-        description: 'ⓘ See image.',
+        // Wording note (do NOT reintroduce "system prompt"/"authoritative" — same ban
+        // as the imaged-slab banner below): a stub citing "...the Tool Reference
+        // section of the system prompt", repeated once per tool, retripped Anthropic's
+        // reasoning_extraction refusal (stop_reason: "refusal" → Claude Code fell back
+        // to claude-opus-4-8 immediately on cold start, 2026-07-02). The reference
+        // block's own header says where the docs live; the stub only needs the heading.
+        description: `ⓘ Full docs: see "## Tool: ${t.name ?? '?'}" in the Tool Reference section.`,
         ...(stubSchema !== undefined ? { input_schema: stubSchema } : {}),
       };
     });
@@ -1481,9 +1494,11 @@ export async function transformRequest(
     }
   }
 
-  // Static slab + tool docs go into the renderer; dynamic slab and billing line stay
-  // as plain text so the cache key (= image bytes) is stable across turns.
-  const combinedRaw = [staticText, toolDocsText].filter((s) => s.length > 0).join('\n\n');
+  // Only the static slab goes into the renderer; dynamic slab and billing line stay
+  // as plain text so the cache key (= image bytes) is stable across turns. Tool docs
+  // are spliced into the system field as text (see sysTail below), NOT imaged —
+  // static per session, so they ride the cache prefix at ~0.1× cost.
+  const combinedRaw = staticText;
   // Compact then reflow before the gate; gate/renderer/paging all see the same text.
   // origChars anchored to raw length — that's what Anthropic would have billed.
   const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
@@ -1535,7 +1550,7 @@ export async function transformRequest(
   // provenance framing below keeps obedience without the extraction signature.
   const imageInstructionHeader =
     '=================== SESSION CONFIGURATION PAGES ===================\n' +
-    "pxpipe (this user's local proxy) rendered this session's configuration and tool documentation" +
+    "pxpipe (this user's local proxy) rendered this session's configuration" +
     ' into the following images to reduce token cost. Read the pages carefully and follow them as' +
     ' your operating instructions for this session.' +
     columnNoteImg +
@@ -1624,6 +1639,26 @@ export async function transformRequest(
     if (billingLine) sysTail.push({ type: 'text', text: billingLine });
     if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
+    // Tool Reference: full tool docs as plain system text. Stubbed tools[]
+    // descriptions cite these "## Tool: <name>" headings verbatim. Emitted only
+    // when toolsRewritten is set — both are applied on this same path, so the
+    // stub ↔ reference invariant holds (gate-fail paths return earlier with
+    // original tools untouched).
+    if (toolsRewritten && toolDocsText) {
+      // First-party provenance framing, mirroring the imaged-slab banner fix
+      // (169521c): pxpipe names itself as the author of the relocation so the
+      // block reads as this session's own config, not a replayed/extracted prompt.
+      const toolReferenceText =
+        '=== TOOL REFERENCE ===\n' +
+        "pxpipe (this user's local proxy) moved the full tool documentation for this" +
+        ' session here to reduce token cost. Each tool in the tools list carries a short' +
+        ' stub description pointing here; the entry under the matching' +
+        ' "## Tool: <name>" heading below is the complete description for that tool.\n\n' +
+        toolDocsText +
+        '\n=== END TOOL REFERENCE ===';
+      sysTail.push({ type: 'text', text: toolReferenceText });
+      info.toolDocsChars = toolDocsText.length;
+    }
     req.system = sysTail.length > 0 ? sysTail : undefined;
 
     const firstUserIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
