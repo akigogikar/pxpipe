@@ -398,6 +398,12 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     expect(lastUserText(cap2.main[0]!.body)).toContain('# Environment');
     expect(sysText(cap2.main[0]!.body)).not.toContain('modified: src/pricing.ts');
     expect(sysText(cap2.main[0]!.body)).not.toContain('# Environment');
+    // Regression (2026-07): the relocated block must be delimited as injected
+    // context, never blended into user prose — undelimited, it can BECOME the
+    // entire visible message on an empty/short user turn (observed live).
+    expect(lastUserText(cap2.main[0]!.body)).toMatch(
+      /<system-reminder>[\s\S]*relocated by pxpipe[\s\S]*# Environment[\s\S]*<\/system-reminder>/,
+    );
   });
 
   it('FIRST COLLAPSE (turn-2 rewrite): no frozen chunk yet → anchor stays on the SLAB image', async () => {

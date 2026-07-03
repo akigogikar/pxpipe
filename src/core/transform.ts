@@ -1983,7 +1983,19 @@ export async function transformRequest(
   // AFTER 5b so they are never run through tool_result compression. Note
   // tool_result blocks legally precede trailing text blocks in a user message
   // (Claude Code appends its own system-reminders the same way).
+  //
+  // The block is wrapped in <system-reminder> tags so the model (and any
+  // human reading a transcript) attributes it as injected context, NOT user
+  // prose. Without the wrapper the relocated "# Environment" section blends
+  // seamlessly into the user's message — on an empty/short user turn it can
+  // BECOME the entire visible message (observed live, 2026-07). The wrapper
+  // rides in the volatile tail behind the slab anchor, so it costs ~60 chars
+  // per request and cannot perturb the cached prefix. Same-pass safety: 5a
+  // (compressReminders) runs earlier and only scans the first user message,
+  // so this block is never self-imaged; and pxpipe is stateless per request,
+  // so the wrapper never appears in inbound client history (no compounding).
   if (volatileEnvText) {
+    const wrappedEnvText = `<system-reminder>\nContext relocated by pxpipe from the system prompt (volatile per-turn environment state — not written by the user):\n\n${volatileEnvText}\n</system-reminder>`;
     const msgs = req.messages ?? [];
     for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i]!;
@@ -1991,8 +2003,8 @@ export async function transformRequest(
       const content = Array.isArray(m.content)
         ? m.content
         : [{ type: 'text' as const, text: m.content }];
-      msgs[i] = { ...m, content: [...content, { type: 'text' as const, text: volatileEnvText }] };
-      info.envRelocatedChars = volatileEnvText.length;
+      msgs[i] = { ...m, content: [...content, { type: 'text' as const, text: wrappedEnvText }] };
+      info.envRelocatedChars = wrappedEnvText.length;
       break;
     }
   }
