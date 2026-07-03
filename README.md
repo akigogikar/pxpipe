@@ -2,56 +2,43 @@
 
 **Cut Claude Code's input tokens by rendering bulky context as images — the same system prompt, tool docs, and history, in a fraction of the tokens.**
 
-An image's token cost is fixed by its pixel dimensions, not by how much
-text is inside it. Dense content (code, JSON, tool output) packs ~3.1 chars per
-image-token vs ~1 char per text-token on real Claude Code traffic. pxpipe is a
-local proxy that exploits that gap: it rewrites the bulky parts of your
-request (system prompt, tool docs, older history) into compact PNGs before
-the request leaves your machine.
-
-Savings are **workload-dependent** — pxpipe wins on token-dense content and
-leaves sparse/small requests untouched — so these are measured snapshots, not
-constants. The primary, durable result is **input-token reduction**: dense
-system prompts, tool docs, and history go in as compact images instead of text
-(the example above is ≈25k text tokens rendered as ≈2.7k image tokens), every
-request measured against its own `count_tokens` counterfactual. **Dollars are
-downstream of that** — at current Fable list prices the token cut lands as a
-**~59–70% lower end-to-end bill** (~72–74% on compressed requests; full pricing
-math in the FAQ). But list prices can change tomorrow and the token count
-won't, so tokens — not dollars — are the number to watch. Reproduce both from
+An image's token cost is fixed by its pixel dimensions, not by how much text
+is inside it. Dense content (code, JSON, tool output) packs ~3.1 chars per
+image-token vs ~1 char per text-token on real Claude Code traffic. pxpipe is
+a local proxy that exploits the gap: it rewrites the bulky parts of each
+request into compact PNGs before it leaves your machine. At current Fable
+list prices that lands as a **~59–70% lower end-to-end bill** — but prices
+move and workloads differ, so the durable number is the token cut itself,
+measured per-request against a free `count_tokens` counterfactual in
 `~/.pxpipe/events.jsonl`.
 
 This is what the model sees instead of text:
 
 ![example: a real `transformRequest` output: system prompt + tool docs reflowed into one dense 1573×1248 page, instruction banner on top, ↵ marking original newlines](https://raw.githubusercontent.com/teamchong/pxpipe/main/docs/assets/example-render.png)
 
-*~48k characters of system prompt + tool docs (this repo's own README,
-FINDINGS, and source), ≈25k tokens as text, ≈2.7k image tokens as this page.
-Produced by the real `transformRequest` pipeline: whitespace-minified, reflowed
-into full rows with ↵ marking original newlines, OCR instruction banner
-co-rendered on top. The model reads renders like this at 100/100 on a clean
-eval (see benchmarks).*
+*~48k chars of system prompt + tool docs: ≈25k tokens as text, ≈2.7k image
+tokens as this page. Real pipeline output; the model reads renders like this
+at 100/100 (see benchmarks).*
 
 ## Demo
 
-**Fable 5 demo (the default, 100/100 reader):**
+**Fable 5 (the default, 100/100 reader) — plain left, pxpipe right:**
 
 https://github.com/user-attachments/assets/1c8ee63a-fcd7-4958-917b-da788d718349
 
-* Both demos with both panes on **Fable 5** (plain left, pxpipe right).
+pxpipe counts an exact token **10/10** across 39 imaged filler files
+(matches `grep` line-for-line), gets the multi-step ledger arithmetic right,
+and ends the session at **$6.06** with context to spare (73.5k/1M) vs
+**$42.21** at 96% full. One caveat visible in the clip: the pxpipe arm
+needed a nudge to match the requested one-line output format.
 
-- **Fable reads what Opus can't.** The imaged phrase-count that Opus refuses (see the Opus demo below): the pxpipe arm counts the exact token **10/10** across 39 imaged filler files (matches `grep` ground truth line-for-line) and gets the multi-step ledger arithmetic right (8037 → … → 15,021).
-- **Same answers, ~7× cheaper.** Session totals after both demos: plain **$42.21**, context **96% full** (964.5k/1M — one task away from forced compaction) vs pxpipe **$6.06** with context to spare (73.5k/1M).
-- **Honest caveat, visible in the clip:** the pxpipe arm answered the count first and needed one follow-up nudge to also print the ledger balance in the requested one-line format; the plain arm followed the format on the first try. Legibility is solved on Fable — single-reply format compliance is the remaining rough edge.
-
-**Opus 4.8 demo (Opus disabled by default):**
+**Opus 4.8 (disabled by default) — same layout:**
 
 https://github.com/user-attachments/assets/f4e50137-31b5-426f-a6ed-b83f829b4a2c
 
-*Side-by-side — plain Claude (left) vs pxpipe (right), both on **Opus 4.8** (opt-in; pxpipe is tuned for Fable — see the Fable clip above). Click the image to watch (Google Drive).*
-
-- **Demo 1 — fix a failing test suite:** both pass; the dashboard shows pxpipe cut the request to a fraction of the tokens (real, server-measured **context/token reduction**).
-- **Demo 2 — a big file-context (40 files, ~382k tokens) plus a math question and a "count this phrase" task:** the math answer (a small **text** needle) reads on both. The phrase-count needs reading the **imaged** filler — so pxpipe-on-Opus can't read it and **honestly surfaces that it won't fabricate a number** (the documented lossy limit: exact values stay text). Plain, meanwhile, bogs down counting file-by-file.
+Text needles read fine on both arms; the imaged phrase-count doesn't read on
+Opus — and pxpipe **says so instead of fabricating a number**. That misread
+rate is why Opus is opt-in.
 
 ## Try it (30 seconds)
 
@@ -60,57 +47,36 @@ npx pxpipe-proxy                                  # proxy on 127.0.0.1:47821
 ANTHROPIC_BASE_URL=http://localhost:47821 claude  # point Claude Code at it
 ```
 
-Open <http://127.0.0.1:47821/> for a live dashboard: tokens saved, per-session
-stats, every text→image conversion side by side, a global kill switch, and
-runtime model chips including GPT 5.6 and GPT 5.5.
+Dashboard at <http://127.0.0.1:47821/>: tokens saved, every text→image
+conversion side by side, kill switch, live model chips. Responses stream
+normally — pxpipe compresses the *request* only, never the model's output.
+Recent turns stay text; the system prompt, tool docs, and older bulk history
+are imaged.
 
-Nothing else changes. Responses stream normally; pxpipe only compresses the
-*request* (your context going up), never the model's output. Recent turns stay
-text; the system prompt, tool docs, and older bulk history are imaged.
+## The honest part
 
-## The honest part, read before relying on it
-
-**It is lossy.** pxpipe is a *gist* tier, not a lossless store. In a
-needle-in-haystack eval, exact 12-char hex strings inside dense imaged content
-came back **0/15** on Opus and 13/15 on Fable 5, and the failure mode is
-*silent confabulation*: a plausible wrong value, not an error. Anything you
-need back byte-exact (IDs, hashes, secrets, exact numbers) must stay text.
-Recent turns do; a dedicated verbatim-risk guard is not built yet.
-
-**Exact-recall escape hatch.** pxpipe only images Fable requests
-(`PXPIPE_MODELS=claude-fable-5`), so any subagent on a non-Fable model passes
-through as text. Route work that needs byte-exact values to one — globally with
-`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6`, or per-agent with `model: sonnet`
-in the agent frontmatter. It reads from source (file/JSONL), not the imaged
-history. This covers exact-recall you route on purpose; it does **not** catch a
-silent misread you did not expect — that is the unbuilt guard above.
-
-**Does it break real work?** Parity in what we measured: a 10-instance
-SWE-bench Lite pilot (the easy subset) resolved **10/10 on both arms**,
-pxpipe ON at $27 vs OFF at $54 token-equivalent, and 19 SWE-bench Pro
-pairs (harder, long-horizon) resolved **14/19 ON vs 15/19 OFF** at
-**-60% per-request**: verdicts agree on 18/19, and the single split
-(one ON fail) re-resolved 3/3 when replicated, i.e. run-to-run agentic
-variance, not compression. Small n, details and caveats below.
-
-**Savings are workload-dependent.** It wins on token-dense content
-(~1 char/token: code, JSON, hashes) and *loses money* on sparse English prose
-(~3.5 chars/token). The built-in gate only images content where the math wins,
-calibrated against N=391 production rows.
-
-**Model scope:** one `PXPIPE_MODELS` CSV controls which model bases get imaged
-across both families — default `claude-fable-5,gpt-5.6` (GPT 5.5 is opt-in;
-it degrades on imaged context). Set
-`PXPIPE_MODELS=off` to disable imaging entirely, or use
-`~/.config/pxpipe/config.json` with `{ "models": "off" }` (or a list). For GPT,
-pxpipe keeps tool definitions in native JSON (only verbose schema prose moves
-into the image) so tool-calling stays reliable; unlike the Claude path, the GPT
-path does not add or depend on Anthropic `cache_control` prompt-cache markers.
-The dashboard chips can flip any model live without changing client configs.
-Opus 4.7/4.8 was the original Claude scope but misread ~7% of renders
-(`10200`→`9400`), so it was turned off by default once Fable 5 hit 100/100 with
-identical image billing — opt it back in at your own risk via `PXPIPE_MODELS` or
-the dashboard chips. Everything else passes through untouched.
+- **It is lossy.** Exact 12-char hex strings in dense imaged content:
+  **13/15** on Fable 5, **0/15** on Opus — and misses are *silent
+  confabulations*, not errors. Byte-exact values (IDs, hashes, secrets)
+  must stay text; recent turns do. A dedicated verbatim-risk guard is not
+  built yet.
+- **Escape hatch:** subagents on non-allowlisted models pass through as
+  text — route byte-exact work there
+  (`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6`, or `model: sonnet` in
+  agent frontmatter).
+- **Real work:** SWE-bench Lite pilot **10/10 both arms** at −65% request
+  size; SWE-bench Pro **14/19 ON vs 15/19 OFF** at −60%, verdicts agree
+  18/19, and the single split re-resolved 3/3 on replication — run-to-run
+  variance, not compression. Small n; receipts in `eval/`.
+- **Workload-dependent.** Wins on token-dense content (~1 char/token),
+  loses money on sparse prose (~3.5 chars/token); a profitability gate
+  (calibrated on N=391 production rows) images only where the math wins.
+- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gpt-5.6`. Opus
+  4.7/4.8 misread ~7% of renders and GPT 5.5 degrades on imaged context, so
+  both are opt-in via `PXPIPE_MODELS` or the dashboard chips.
+  `PXPIPE_MODELS=off` disables imaging. Everything else passes through
+  byte-identical. On the GPT path, tool definitions stay native JSON and no
+  Anthropic `cache_control` markers are used.
 
 ## Benchmarks (reproducible)
 
@@ -126,43 +92,51 @@ Measured with novel random-number problems the model cannot have memorized:
 | verbatim 12-char hex recall, dense render, Opus | 15 | 15/15 | **0/15** | - |
 | verbatim 12-char hex recall, dense render, Fable 5 | 15 | - | **13/15** | - |
 
-### SWE-bench Lite pilot (end-to-end task quality)
+SWE-bench run totals, receipts, and caveats:
+[`eval/swe-bench/`](eval/swe-bench/) ·
+[`eval/swe-bench-pro/`](eval/swe-bench-pro/) ·
+[`eval/needle-haystack/`](eval/needle-haystack/) ·
+[`eval/gist-recall/`](eval/gist-recall/) · analysis in
+[`FINDINGS.md`](FINDINGS.md). (GSM8K scored 96% imaged, but it's in training
+data — memorized answers survive misreads — so we lead with the novel-number
+evals.)
 
-10 SWE-bench Lite instances, Claude Code + Fable 5, paired runs through
-pxpipe ON vs OFF, graded with the official `swebench` Docker harness:
+## How it works
 
-| | pxpipe ON | OFF |
-|---|---:|---:|
-| resolved | **10/10** | 10/10 |
-| request size vs own uncompressed body | **−65%** | ±0 |
+```
+tool_result string ──► wrap at 1928px-wide columns ──► pack ~92,000 chars/page ──► PNG[]
+```
 
-The −65% is per-request (`count_tokens` probe of each body before
-compression), so it has no turn-count confound. n=10/arm, Lite skews easy.
-Run totals, receipts, caveats: [`eval/swe-bench/`](eval/swe-bench/).
+The proxy intercepts `/v1/messages`, rewrites eligible bulk into image
+blocks, splices them back cache-friendly (static prefix preserved, prompt
+caching keeps working), and forwards. A 1928×1928 image costs ≈4,761 vision
+tokens and holds ≈92,000 chars, so text wins only above ~19 chars/token —
+Claude Code traffic runs ~1.91 (N=391). A per-request estimator decides;
+sparse prose stays text. Events log to `~/.pxpipe/events.jsonl`.
 
-### SWE-bench Pro bench (harder, long-horizon)
+## Library use (no proxy)
 
-19 completed pairs across two runs (2 dropped: checkout failed both
-arms), same setup, official `SWE-bench_Pro-os` Docker harness:
+```ts
+import { renderTextToPngs, transformAnthropicMessages } from "pxpipe";
 
-| | pxpipe ON | OFF |
-|---|---:|---:|
-| resolved | 14/19 | 15/19 |
-| request size vs own uncompressed body | **−60%** | ±0 |
+const imgs = await renderTextToPngs(toolResultText);            // RenderedImage[]
+const { body, applied, info } = await transformAnthropicMessages({
+  body: requestBytes,
+  model: "claude-fable-5",
+});
+```
 
-Verdicts agree on 18/19 (three instances failed both arms, one with
-byte-identical patches across arms). The single split (navidrome, ON
-fail) was replicated 3x on the ON arm: all three runs produced an
-identical patch and **resolved**, so the original loss was run-to-run
-agentic variance, not compression. Receipts:
-[`eval/swe-bench-pro/`](eval/swe-bench-pro/).
+`options.keepSharp(block)` pins blocks as text; `options.emitRecoverable`
+returns the originals of imaged blocks. Pure-JS runtime (Node and
+edge/Workers); `@napi-rs/canvas` is build-time only. Full API:
+`src/core/index.ts`.
 
-<sub>We also ran GSM8K: 96% imaged. But GSM8K is in training data, so the model
-recalls memorized answers through its own misreads, inflating the score, so we
-lead with the clean novel-number eval instead. Reproduce:
-[`eval/gsm8k/`](eval/gsm8k/) · [`eval/needle-haystack/`](eval/needle-haystack/) ·
-[`eval/gist-recall/`](eval/gist-recall/) ·
-full analysis in [`FINDINGS.md`](FINDINGS.md).</sub>
+## Development
+
+```bash
+pnpm install && pnpm test
+pnpm run build                # regenerates dist/
+```
 
 ## FAQ
 
@@ -199,7 +173,11 @@ Three kinds of *input* blocks, each behind a profitability gate:
 
 Everything else passes through byte-identical: your messages, recent turns,
 the model's output (it is the response, the proxy never touches it), sparse
-prose, and anything too small to win. Non-Fable models pass through entirely.
+prose, and anything too small to win. Models outside the allowlist pass
+through entirely — the default scope is Fable 5 and GPT 5.6 only. Opus 4.8
+and GPT 5.5 read imaged content measurably worse (FINDINGS.md 2026-06-16),
+so they are deliberately opt-in via the dashboard or `PXPIPE_MODELS`, never
+silently imaged.
 
 **Has it ever failed for real, outside the benchmarks?**
 Yes, once in weeks of daily use: the model recalled a person's name from
@@ -207,82 +185,32 @@ imaged chat history and got it confidently wrong. No error, just a
 plausible wrong name. That is the documented failure mode: exact strings
 in imaged content are not byte-safe. Coding sessions tolerate this because
 the agent re-reads files before editing; pure chat recall has no such check.
+This failure mode is measured, not anecdotal:
+[the legibility audit](docs/LEGIBILITY-AUDIT-2026-07-01.md) quantifies
+exact-string recall off rendered pages (blind reads top out at 63% on dense
+identifiers, with every miss predicted by a glyph-confusability matrix) and
+documents the shipped mitigations — page geometry clamped to the API's
+resample cap so billed pixels actually reach the vision encoder, and exact
+identifiers (SHAs, numbers) riding alongside as text.
 
-## How it works
-
-```
-tool_result string ──► wrap at 1928px-wide columns ──► pack ~92,000 chars/page ──► PNG[]
-```
-
-The proxy intercepts `/v1/messages`, rewrites eligible bulk history into image
-blocks, splices them back cache-friendly (static prefix preserved, so prompt
-caching keeps working), and forwards. Per-request events log to
-`~/.pxpipe/events.jsonl`.
-
-The economics: a 1928×1928 image costs ≈4,761 vision tokens and holds up to
-≈92,000 chars (≈48,000 text tokens at the observed density), so plain text is
-cheaper *only* when it runs denser than ~19 chars/token. Claude Code transcripts
-are far below that (observed 1.91 chars/token, N=391). The runtime estimator (`estimateImageCount`) plus a chars/token gate
-decides per-request; sparse prose is left as text.
-
-## Library use (no proxy)
-
-Same engine, no proxy. Render text → PNGs, or run the full cache-safe transform:
-
-```ts
-import { renderTextToPngs, transformAnthropicMessages } from "pxpipe";
-
-const imgs = await renderTextToPngs(toolResultText);            // RenderedImage[]
-const { body, applied, info } = await transformAnthropicMessages({
-  body: requestBytes,
-  model: "claude-fable-5",
-});
-```
-
-`options.keepSharp(block)` pins blocks as text (override the heuristic for IDs,
-hashes, paths); `options.emitRecoverable` returns the originals of imaged blocks
-so a stateful caller can recover them — the two halves of the fidelity contract
-for the lossy limitation below. Runtime is pure-JS (Node and edge/Workers);
-`@napi-rs/canvas` is build-time only. Full API, types, and constants:
-`src/core/index.ts`.
-
-## Development
-
-```bash
-pnpm install && pnpm test     # 376 tests
-pnpm run build                # regenerates dist/
-```
+**Why does the README read like an AI wrote it?**
+Because one did. Most of this repo's commits — the code and the docs — were
+authored by Opus/Fable agent sessions running behind pxpipe itself, reading
+their own collapsed history as image pages while they worked.
 
 ## Limitations
 
-* **Lossy**: see "the honest part" above. Verbatim recall from images is unreliable.
-* Render latency: encoding PNGs adds time to large requests before they leave
-  (partly offset by the model ingesting fewer tokens). Responses stream normally.
-* ASCII/Latin-1 well tested; CJK works but conservatively.
-* Runtime is pure-JS — runs on Node and edge/Workers. `@napi-rs/canvas` is a
-  build-time-only dev dep (regenerating the glyph atlas), not a runtime dep.
-* Fable 5 only.
+- Lossy (above); verbatim recall from images is unreliable.
+- PNG encoding adds latency to large requests before they leave.
+- ASCII/Latin-1 well tested; CJK works but conservatively.
 
 ## Roadmap
 
-Everything above is measured. Everything here is not. These are hypotheses, not
-claims; they ship as numbers with an n or they get cut.
-
-* **Sharper glyphs.** The 13/15 verbatim gap is partly font legibility, not just
-  the model. A per-char confusion matrix across render styles is paused mid-run
-  (`eval/glyph-matrix/`); if a zero-cost style lowers read error, the gate
-  compresses harder at the same fidelity.
-* **Effective context.** Dense text carries at ~3x fewer tokens as images. If
-  that holds in the live window and not just the bill, 1M tokens holds ~2x the
-  real content. Open question: can a task needing ~2M raw context run inside
-  Fable's 1M once the bulk is imaged?
-* **Less active text, sharper model.** Long contexts degrade reasoning as they
-  fill. Imaging old bulk shrinks what the model actively reads while keeping it
-  reachable. Hypothesis: same information, smaller active context, better
-  long-task accuracy.
-
-One bet: longer effective context and a sharper model on long tasks, from the
-same Fable 5. Numbers or retraction, no hype between.
+Hypotheses, not claims — they ship as numbers with an n or they get cut:
+sharper glyph rendering (`eval/glyph-matrix/`, paused mid-run), whether
+imaged bulk stretches effective context (~2x the real content in the same
+1M window), and whether a smaller active context improves long-task
+accuracy.
 
 ## License
 
