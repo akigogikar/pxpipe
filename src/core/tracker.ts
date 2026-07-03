@@ -65,6 +65,8 @@ export interface TrackEvent {
   passthrough_reasons?: { below_threshold?: number; not_profitable?: number };
   /** Unrecognized tag names in the static slab — canary for Claude Code releases adding new dynamic tags. */
   unknown_static_tags?: string[];
+  /** Slab tags whose content changed within a session — proven per-turn dynamics busting the image cache. */
+  churning_static_tags?: string[];
   /** Per-bucket TEXT chars through each gate call site (static_slab, reminder, tool_result_*, history).
    *  Undefined on uncompressed requests; enables per-bucket cpt regression. */
   bucket_chars?: Partial<Record<
@@ -258,6 +260,8 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.cachePrefixBytes !== undefined) out.cache_prefix_bytes = info.cachePrefixBytes;
     if (info.unknownStaticTags && info.unknownStaticTags.length > 0)
       out.unknown_static_tags = info.unknownStaticTags;
+    if (info.churningStaticTags && info.churningStaticTags.length > 0)
+      out.churning_static_tags = info.churningStaticTags;
     if (info.systemSha8) out.system_sha8 = info.systemSha8;
     if (info.claudeMdSha8) out.claude_md_sha8 = info.claudeMdSha8;
     if (info.firstUserSha8) out.first_user_sha8 = info.firstUserSha8;

@@ -166,6 +166,10 @@ const CHARS_PER_TOKEN = 4;
  *  Slab-specific because reminders/tool_results have unknown shape; those stay at 4. */
 export const SLAB_CHARS_PER_TOKEN = 2.0;
 
+// Tools whose stub description keeps a live-text read-before-edit precondition
+// when full docs move into the imaged Tool Reference (read-gate audit, 2026-07-03).
+const READ_FIRST_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
+
 /** Empirical cpt for the history-collapse path (same Opus 4.7 telemetry as SLAB_CHARS_PER_TOKEN).
  *  History is even denser (tool_use JSON dominates), so 2.0 is doubly conservative. */
 export const HISTORY_CHARS_PER_TOKEN = 2.0;
@@ -518,6 +522,9 @@ export interface TransformInfo {
   /** Tag-shaped blocks in the static slab not in DYNAMIC_BLOCK_TAGS.
    *  Canary: a new per-turn Claude Code tag would appear here before cache rate collapses. */
   unknownStaticTags?: string[];
+  /** Static-slab tags whose content changed within a session — proven dynamic,
+   *  busting the image cache each turn. The real alert signal. */
+  churningStaticTags?: string[];
   env?: EnvFields;
   /** sha8 of static slab + tool docs (what goes in the image). Repeats across turns → cache hits. */
   systemSha8?: string;
@@ -650,19 +657,45 @@ const DYNAMIC_BLOCK_TAGS = [
   'system-reminder',
 ] as const;
 
-// Known-static tags in the slab (part of Claude Code's built-in prompt, not per-turn).
-// Listed here so the canary in splitStaticDynamic doesn't false-fire on them.
-// Add a tag only after confirming it doesn't rotate per turn.
-const KNOWN_STATIC_TAGS = ['types'] as const;
+// Known-static slab tags — suppresses first-sighting `unknownStaticTags` noise
+// only. Correctness doesn't depend on this list: observeStaticTagChurn catches
+// a wrong entry on its second sighting.
+const KNOWN_STATIC_TAGS = [
+  // Claude Code
+  'types',
+  // opencode (codex system prompts have no tag-shaped blocks)
+  'example',
+  'available_skills',
+  // beast.txt + title.txt
+  'examples',
+  'rules',
+  'task',
+  // copilot-gpt-5.txt
+  'codeSearchInstructions',
+  'codeSearchToolUseInstructions',
+  'communicationGuidelines',
+  'gptAgentInstructions',
+  'outputFormatting',
+  'structuredWorkflow',
+  'toolUseInstructions',
+] as const;
 
 function splitStaticDynamic(text: string): {
   staticText: string;
   dynamicText: string;
   blockCount: number;
   unknownTags: string[];
+  /** tag → concatenated inner content of same-named slab blocks. */
+  staticTagContents: Map<string, string>;
 } {
   if (!text)
-    return { staticText: '', dynamicText: '', blockCount: 0, unknownTags: [] };
+    return {
+      staticText: '',
+      dynamicText: '',
+      blockCount: 0,
+      unknownTags: [],
+      staticTagContents: new Map(),
+    };
   const pattern = new RegExp(
     `<(${DYNAMIC_BLOCK_TAGS.join('|')})(\\s[^>]*)?>[\\s\\S]*?</\\1>`,
     'g',
@@ -683,13 +716,16 @@ function splitStaticDynamic(text: string): {
   // surfacing the tag name lets us detect it within hours of a release.
   const known = new Set<string>(DYNAMIC_BLOCK_TAGS);
   const knownStatic = new Set<string>(KNOWN_STATIC_TAGS);
-  const sniffer = /<([a-zA-Z][a-zA-Z0-9_-]*)(?:\s[^>]*)?>[\s\S]*?<\/\1>/g;
+  const sniffer = /<([a-zA-Z][a-zA-Z0-9_-]*)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/g;
   const unknown = new Set<string>();
+  const staticTagContents = new Map<string, string>();
   let s: RegExpExecArray | null;
   while ((s = sniffer.exec(staticBuf)) !== null) {
     const tag = s[1]!;
-    if (!known.has(tag) && !knownStatic.has(tag) && tag.length <= 64)
-      unknown.add(tag);
+    if (tag.length > 64) continue;
+    if (!known.has(tag) && !knownStatic.has(tag)) unknown.add(tag);
+    // Fold repeated tags (e.g. several <example>s) into one fingerprint.
+    staticTagContents.set(tag, (staticTagContents.get(tag) ?? '') + s[2]!);
   }
 
   return {
@@ -698,7 +734,47 @@ function splitStaticDynamic(text: string): {
     dynamicText: dynamicParts.join('\n\n'),
     blockCount: dynamicParts.length,
     unknownTags: [...unknown],
+    staticTagContents,
   };
+}
+
+/** FNV-1a 32-bit — cheap synchronous content fingerprint for churn detection. */
+function fnv1a(text: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+// Last content hash per (session, tag). Bounded LRU.
+const TAG_OBSERVATIONS_MAX = 4096;
+const tagObservations = new Map<string, number>();
+
+/** Returns slab tags whose content changed since the last sighting in the same
+ *  session — proven per-turn dynamics, whatever the hardcoded lists say. */
+function observeStaticTagChurn(
+  sessionKey: string,
+  tagContents: ReadonlyMap<string, string>,
+): string[] {
+  const churned: string[] = [];
+  for (const [tag, inner] of tagContents) {
+    const key = `${sessionKey}\0${tag}`;
+    const hash = fnv1a(inner);
+    const prev = tagObservations.get(key);
+    if (prev !== undefined) {
+      if (prev !== hash) churned.push(tag);
+      tagObservations.delete(key); // refresh LRU position
+    }
+    tagObservations.set(key, hash);
+  }
+  while (tagObservations.size > TAG_OBSERVATIONS_MAX) {
+    const oldest = tagObservations.keys().next().value;
+    if (oldest === undefined) break;
+    tagObservations.delete(oldest);
+  }
+  return churned;
 }
 
 /** sha256[0..8] hex via Web Crypto (works in Node 18+ and Workers). 32-bit collision-safe. */
@@ -1421,6 +1497,7 @@ export async function transformRequest(
     dynamicText,
     blockCount: dynBlocks,
     unknownTags,
+    staticTagContents,
   } = splitStaticDynamic(sysBody);
   info.staticChars = staticText.length;
   info.dynamicChars = dynamicText.length + envMarkdown.length;
@@ -1441,6 +1518,16 @@ export async function transformRequest(
   ]);
   if (claudeMdSha) info.claudeMdSha8 = claudeMdSha;
   if (firstUserSha) info.firstUserSha8 = firstUserSha;
+
+  // Canary: slab tags whose content churns within a session bust the image
+  // cache every turn — report them regardless of the hardcoded lists.
+  if (staticTagContents.size > 0) {
+    const churning = observeStaticTagChurn(
+      firstUserSha ?? claudeMdSha ?? 'global',
+      staticTagContents,
+    );
+    if (churning.length > 0) info.churningStaticTags = churning;
+  }
 
   // 2. Move tool docs into the imaged "Tool Reference", stubbing originals.
   //    Imaged (not text) because that IS the compression — descriptions and
@@ -1470,6 +1557,17 @@ export async function transformRequest(
           schema = stripped;
         }
       }
+      // Read-before-Edit precondition rides as LIVE TEXT, not imaged: the CLI
+      // rejects Edit/Write on any existing file not Read in THIS session's
+      // process, and the rule lost salience once full tool docs moved into the
+      // imaged reference (read-gate audit, 2026-07-03). Three tools only, no
+      // banned wording — stays clear of the per-tool-stub repetition pattern
+      // that tripped reasoning_extraction (see wording note below).
+      const readFirstNote = READ_FIRST_TOOLS.has(t.name ?? '')
+        ? ' Requires a Read of the same file earlier in THIS session when the file' +
+          ' already exists — the call is rejected otherwise; file content recalled' +
+          ' from imaged or prior-session context does not satisfy this.'
+        : '';
       return {
         ...t,
         // Wording note (do NOT reintroduce "system prompt"/"authoritative" — same ban
@@ -1478,7 +1576,7 @@ export async function transformRequest(
         // reasoning_extraction refusal (stop_reason: "refusal" → Claude Code fell back
         // to claude-opus-4-8 immediately on cold start, 2026-07-02). The reference
         // block's own header says where the docs live; the stub only needs the heading.
-        description: `ⓘ Full docs: see "## Tool: ${t.name ?? '?'}" in the Tool Reference section.`,
+        description: `ⓘ Full docs: see "## Tool: ${t.name ?? '?'}" in the Tool Reference section.${readFirstNote}`,
         ...(schema !== undefined ? { input_schema: schema } : {}),
       };
     });

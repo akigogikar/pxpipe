@@ -19,6 +19,7 @@ import { describe, expect, it } from 'vitest';
 import {
   findClosedPrefixBoundary,
   blocksToText,
+  staleFreshnessHints,
   messagesToHistoryText,
   collapseHistory,
   HISTORY_DEFAULTS,
@@ -203,6 +204,48 @@ describe('blocksToText', () => {
         },
       ]),
     ).toBe('[image]');
+  });
+});
+
+describe('staleFreshnessHints (read-gate audit, 2026-07-03)', () => {
+  const HINT = '(file state is current in your context — no need to Read it back)';
+  const STALE =
+    '(state as of this PRIOR turn — the file may have changed since; Read it again before editing)';
+
+  it('rewrites the canonical Claude Code freshness hint', () => {
+    const input = `The file /tmp/x.ts has been updated successfully. ${HINT}`;
+    expect(staleFreshnessHints(input)).toBe(
+      `The file /tmp/x.ts has been updated successfully. ${STALE}`,
+    );
+  });
+
+  it('rewrites the line-wrapped variant (3 of ~2,125 logged instances)', () => {
+    const wrapped =
+      '(file state is current in your\n  context — no need to Read it back)';
+    expect(staleFreshnessHints(`ok. ${wrapped}`)).toBe(`ok. ${STALE}`);
+  });
+
+  it('rewrites every occurrence, not just the first', () => {
+    const out = staleFreshnessHints(`${HINT} middle ${HINT}`);
+    expect(out).toBe(`${STALE} middle ${STALE}`);
+    expect(out).not.toContain('no need to Read it back');
+  });
+
+  it('leaves unrelated text untouched', () => {
+    const s = 'Edit rejected: File has not been read yet. Read it first.';
+    expect(staleFreshnessHints(s)).toBe(s);
+  });
+
+  it('applies inside blocksToText tool_result serialisation', () => {
+    const out = blocksToText([
+      {
+        type: 'tool_result',
+        tool_use_id: 'tx1',
+        content: `The file /a/b.ts has been updated successfully. ${HINT}`,
+      },
+    ]);
+    expect(out).toContain(STALE);
+    expect(out).not.toContain('no need to Read it back');
   });
 });
 

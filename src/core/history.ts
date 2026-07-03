@@ -161,6 +161,28 @@ export function findClosedPrefixBoundary(
 }
 
 /**
+ * Claude Code appends "(file state is current in your context — no need to Read it
+ * back)" to Edit/Write tool_results. True when emitted; stale by the time the turn
+ * reaches this serializer: everything blocksToText feeds becomes collapsed/imaged
+ * HISTORY, the CLI's read-ledger resets on process restart, and the file may have
+ * changed in later turns anyway. Models trusting the hint from prior turns were the
+ * dominant cause of `File has not been read yet` gate errors (2026-07-03 audit,
+ * n=55 classified: 20 had a same-transcript Read invalidated by a restart while
+ * this hint said "current"; 34 edited from prior-session context with no Read at
+ * all). Rewriting at serialization time also cleans slabs inherited by future
+ * continuation sessions. Whitespace-tolerant match: 3 of ~2,125 logged instances
+ * wrap mid-hint.
+ */
+const FRESHNESS_HINT_RE =
+  /\(file state is current in your\s+context — no need to Read it back\)/g;
+const STALE_FRESHNESS_NOTE =
+  '(state as of this PRIOR turn — the file may have changed since; Read it again before editing)';
+
+export function staleFreshnessHints(text: string): string {
+  return text.replace(FRESHNESS_HINT_RE, STALE_FRESHNESS_NOTE);
+}
+
+/**
  * Linearise content blocks to a single string. Drops thinking blocks (only the
  * most-recent assistant turn needs bit-perfect thinking, and it's in the live tail).
  * Inline images collapse to [image] to avoid double-encoding.
@@ -208,7 +230,7 @@ export function blocksToText(content: string | ContentBlock[]): string {
           innerText = '';
         }
         const errMark = tr.is_error === true ? ' (error)' : '';
-        parts.push(`[tool_result${errMark}]\n${innerText}`);
+        parts.push(`[tool_result${errMark}]\n${staleFreshnessHints(innerText)}`);
         break;
       }
       case 'image':
