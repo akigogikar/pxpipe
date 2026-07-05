@@ -1213,6 +1213,11 @@ function patchClaudeSettings(): void {
   env.HTTPS_PROXY = MITM_PROXY_URL;
   env.HTTP_PROXY = MITM_PROXY_URL;
   env.NODE_EXTRA_CA_CERTS = caCertPath();
+  // Only api.anthropic.com should route through us. Exclude loopback so local
+  // tools inherited by the session (Ollama/distill, other MCP servers, local
+  // dashboards) are NOT proxied into this MITM and broken.
+  env.NO_PROXY = 'localhost,127.0.0.1,::1';
+  env.no_proxy = 'localhost,127.0.0.1,::1';
   cfg.env = env;
   fs.mkdirSync(path.dirname(CLAUDE_SETTINGS), { recursive: true });
   fs.writeFileSync(CLAUDE_SETTINGS, JSON.stringify(cfg, null, 2) + '\n');
@@ -1289,6 +1294,8 @@ function mitmUninstall(): void {
         delete env.HTTPS_PROXY;
         delete env.HTTP_PROXY;
         delete env.NODE_EXTRA_CA_CERTS;
+        delete env.NO_PROXY;
+        delete env.no_proxy;
       }
       fs.writeFileSync(CLAUDE_SETTINGS, JSON.stringify(cfg, null, 2) + '\n');
       console.log(`[pxpipe mitm] removed proxy keys from ${CLAUDE_SETTINGS}`);
