@@ -4,9 +4,11 @@
 
 An image's token cost is fixed by its pixel dimensions, not by how much text
 is inside it. Dense content (code, JSON, tool output) packs ~3.1 chars per
-image-token vs ~1 char per text-token on real Claude Code traffic. pxpipe is
-a local proxy that exploits the gap: it rewrites the bulky parts of each
-request into compact PNGs before it leaves your machine. At current Fable
+image-token vs ~1 char per text-token on real Claude Code traffic. The
+reader is the same vision channel that Anthropic's computer use already
+relies on for screenshots. pxpipe is a local proxy that uses that channel
+for context: it rewrites the bulky parts of each request into compact PNGs
+before it leaves your machine. At current Fable
 list prices that lands as a **~59–70% lower end-to-end bill** — but prices
 move and workloads differ, so the durable number is the token cut itself,
 measured per-request against a free `count_tokens` counterfactual in
@@ -193,6 +195,20 @@ documents the shipped mitigations — page geometry clamped to the API's
 resample cap so billed pixels actually reach the vision encoder, and exact
 identifiers (SHAs, numbers) riding alongside as text.
 
+**Why are misses silent confabulations instead of read errors?**
+Because model vision is not OCR: the image becomes patch embeddings, never
+discrete characters, so there is no per-glyph confidence to fail loudly
+on. When pixels underdetermine a glyph, the language prior fills the gap
+with something plausible. Mechanism and receipts:
+[docs/NOT-OCR.md](docs/NOT-OCR.md).
+
+**Didn't DeepSeek-OCR show this doesn't hold up in practice?**
+No: it proved the channel works, using an encoder/decoder pair trained for
+the job. The skepticism dates from October 2025, when no stock production
+model could read dense renders; that changed with Fable 5 (0/15 verbatim
+hex on Opus 4.8 vs 13/15 on Fable 5, same pages). Timeline and per-model
+numbers: [docs/NOT-OCR.md](docs/NOT-OCR.md).
+
 **Why does the README read like an AI wrote it?**
 Because one did. Most of this repo's commits — the code and the docs — were
 authored by Opus/Fable agent sessions running behind pxpipe itself, reading
@@ -206,11 +222,21 @@ their own collapsed history as image pages while they worked.
 
 ## Roadmap
 
-Hypotheses, not claims — they ship as numbers with an n or they get cut:
-sharper glyph rendering (`eval/glyph-matrix/`, paused mid-run), whether
-imaged bulk stretches effective context (~2x the real content in the same
-1M window), and whether a smaller active context improves long-task
-accuracy.
+Rendering research is parked as of 2026-07-05: verbatim misreads are
+capacity-bound, not trick-bound, so no font/color/layout change fixes
+exact-string recall at profitable density. The why is in
+[docs/NOT-OCR.md](docs/NOT-OCR.md); the dated analysis and the three
+documented follow-up threads (glyph-style A/B with banked pages, runtime
+canary + re-fetch, surrogate-reader pre-flight) are in
+[FINDINGS.md](FINDINGS.md), 2026-07-05 entry. Watch condition: re-run the
+resolution sweep per model release; readable density moved ~4x in glyph
+area from Opus 4.8 to Fable 5, and a model that reads production cells
+near 100% means savings rise for free.
+
+Still open, unchanged: whether imaged bulk stretches effective context (~2x
+the real content in the same 1M window), and whether a smaller active
+context improves long-task accuracy. Hypotheses, not claims — they ship as
+numbers with an n or they get cut.
 
 ## License
 
