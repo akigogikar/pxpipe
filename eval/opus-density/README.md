@@ -82,17 +82,27 @@ side-effects. Result — a real negative finding:
 |---|---|---|---|
 | `2` | break an accidental shared pixel with `Z` | **+0.0121** | none |
 | `5` | break an accidental shared pixel with `S` | **+0.0160** | none |
-| `0` | bolden (bigger center dot) | +0.0043 | created 2 new worst-24 collisions (`0~8`, `0~9`) — net negative |
-| `B` | bolden (wider bars) | **−0.0026 worse** | broad convergence toward every boxy capital; `B~O` crashed to 0.0196 |
-| `G` | bolden (bigger crossbar) | ~0 | same broad convergence as `B` |
+| `0` | round 1: bolden (bigger center dot) | +0.0043 | 2 new worst-24 collisions (`0~8`, `0~9`) — reverted |
+| `0` | round 2: de-collide (remove diagonal, add 1px elsewhere) | **−0.0081 worse** | net *reduced* the 0-vs-O distinguishing pixel count (2→1) — arithmetic error, reverted |
+| `B` | bolden (wider bars) | **−0.0026 worse** | broad convergence toward every boxy capital; `B~O` crashed to 0.0196 — reverted, no de-collision move exists (no shared row with `8` to exploit) |
+| `G` | round 1: bolden (bigger crossbar) | ~0 | broad convergence, same failure as `B` — reverted |
+| `G` | round 2: de-collide (same edit shape that worked for `5`) | **−0.0124 worse** | drifted closer to a dozen+ unrelated letters (B,E,M,N,P,R,...) — reverted |
 
-**Mechanism:** at 5×8 + blur + cosine-distance, adding ink pushes a glyph
-toward a generic dense blob that *other* bold capitals also blur into —
+**Mechanism (round 1):** at 5×8 + blur + cosine-distance, adding ink pushes a
+glyph toward a generic dense blob that *other* bold capitals also blur into —
 distance to the one target improves (maybe) while distance to everything else
-shrinks. The techniques that worked instead **relocated or removed** a pixel
-the confusable partner already shared by coincidence — surgical de-collision,
-not bolding. Only `2` and `5` are kept; `0`/`B`/`G` are reverted pending a
-redesign that follows the de-collision technique.
+shrinks. The de-collision technique (relocate/remove a pixel the partner
+shares by coincidence, don't add mass) fixed this for `2`/`5`.
+
+**Round 2 finding:** de-collision does not mechanically generalize. Applying
+the *identical* technique to `0`/`G` failed for two different reasons — `0`'s
+fix accidentally reduced its own distinguishing-pixel budget (a design
+arithmetic error), and `G`'s fix (reusing `5`'s exact successful edit shape)
+still caused broad drift because `0` and `6`/`G` sit in a denser neighborhood
+of similarly-shaped glyphs than the more isolated `2`/`Z` and `5`/`S` pairs. So
+only `2` and `5` are validated after 2 rounds; `0`, `6`/`G`, `8`/`B` are left
+unpatched pending real font-design tooling (out of scope for blind pixel
+patches) rather than a third guess.
 
 Both scripts are offline (no `ANTHROPIC_API_KEY`, `pnpm exec tsx <script>.mjs`)
 and exist to cheaply screen candidates before spending a scored run on them —
