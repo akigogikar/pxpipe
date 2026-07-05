@@ -7,6 +7,7 @@ import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { renderTextToImages } from '../../src/core/library.js';
+import { extractSharp, renderSidecar } from '../../src/core/sharp.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -47,18 +48,26 @@ const QUESTIONS = [
 // that keeps every page in Anthropic's linear, no-downscale billing window).
 // cols = floor((1568 - 2·PAD_X) / cellW), cellW = 5 + cellWBonus, PAD_X = 4.
 const colsFor = (wBonus) => Math.floor((1568 - 8) / (5 + wBonus));
+// `sharp:true` = lever B (content-aware keep-sharp): detector-flagged exact-string
+// spans (hex/uuid/path/flag/ident/port) are lifted out of the imaged body into a
+// small verbatim TEXT sidecar, so the model reads them exactly while prose stays
+// imaged. Density lever A (cell size) and B compose freely below.
 const VARIANTS = [
   { name: '5x8', style: { cellWBonus: 0, cellHBonus: 0, aa: true }, cols: colsFor(0) },
   { name: '7x10', style: { cellWBonus: 2, cellHBonus: 2, aa: true }, cols: colsFor(2) },
   { name: '9x12', style: { cellWBonus: 4, cellHBonus: 4, aa: true }, cols: colsFor(4) },
+  { name: '5x8+sharp', style: { cellWBonus: 0, cellHBonus: 0, aa: true }, cols: colsFor(0), sharp: true },
+  { name: '7x10+sharp', style: { cellWBonus: 2, cellHBonus: 2, aa: true }, cols: colsFor(2), sharp: true },
 ];
 const MODELS = ['claude-opus-4-8', 'claude-fable-5'];
 
 const TEXT_TOKENS = Math.ceil(SESSION.length / 3.5); // rough Claude-Code-dense baseline
 
-async function callModel(model, dataUrls, question) {
+async function callModel(model, dataUrls, question, sidecarText = '') {
   const key = process.env.ANTHROPIC_API_KEY;
   const content = [
+    // Lever B: the exact-value sidecar rides as verbatim text before the images.
+    ...(sidecarText ? [{ type: 'text', text: sidecarText }] : []),
     ...dataUrls.map((u) => ({
       type: 'image',
       source: { type: 'base64', media_type: 'image/png', data: u.replace(/^data:image\/png;base64,/, '') },
@@ -89,18 +98,25 @@ function score(kind, expected, got) {
 const results = { generatedAt: new Date().toISOString(), textTokens: TEXT_TOKENS, variants: [] };
 
 for (const v of VARIANTS) {
-  const { pages } = await renderTextToImages(SESSION, { style: v.style, cols: v.cols, reflow: true });
+  // Lever B: split exact-string spans into a verbatim text sidecar; image the rest.
+  const src = v.sharp ? extractSharp(SESSION) : { body: SESSION, sidecar: [] };
+  const sidecarText = v.sharp ? renderSidecar(src.sidecar) : '';
+  const sidecarTokens = v.sharp ? Math.ceil(sidecarText.length / 3.5) : 0;
+
+  const { pages } = await renderTextToImages(src.body, { style: v.style, cols: v.cols, reflow: true });
   const imageTokens = pages.reduce((n, p) => n + patchTokens(p.width, p.height), 0);
+  const totalTokens = imageTokens + sidecarTokens; // what the request actually costs
   const dataUrls = pages.map((p) => 'data:image/png;base64,' + Buffer.from(p.png).toString('base64'));
-  const savingsPct = Math.round((1 - imageTokens / TEXT_TOKENS) * 100);
-  const row = { variant: v.name, pages: pages.length, dims: pages.map((p) => `${p.width}x${p.height}`), imageTokens, savingsPct, models: {} };
-  console.log(`\n[${v.name}] ${pages.length} page(s) ${row.dims.join(',')} → ${imageTokens} img tok vs ${TEXT_TOKENS} text (${savingsPct}% saved)`);
+  const savingsPct = Math.round((1 - totalTokens / TEXT_TOKENS) * 100);
+  const row = { variant: v.name, sharp: !!v.sharp, sharpSpans: v.sharp ? src.sidecar.length : 0, pages: pages.length, dims: pages.map((p) => `${p.width}x${p.height}`), imageTokens, sidecarTokens, totalTokens, savingsPct, models: {} };
+  const sidecarNote = v.sharp ? ` +${sidecarTokens} sidecar tok (${src.sidecar.length} spans)` : '';
+  console.log(`\n[${v.name}] ${pages.length} page(s) ${row.dims.join(',')} → ${imageTokens} img${sidecarNote} vs ${TEXT_TOKENS} text (${savingsPct}% saved)`);
 
   if (process.env.ANTHROPIC_API_KEY) {
     for (const model of MODELS) {
       const m = { exactCorrect: 0, exactTotal: 0, confab: 0, abstain: 0, gistOk: false, guardOk: false, answers: [] };
       for (const q of QUESTIONS) {
-        const { text, ms } = await callModel(model, dataUrls, q.q);
+        const { text, ms } = await callModel(model, dataUrls, q.q, sidecarText);
         const s = score(q.kind, q.answer, text);
         m.answers.push({ id: q.id, kind: q.kind, expected: q.answer, got: text, ...s, ms });
         if (q.kind === 'exact') { m.exactTotal++; if (s.ok) m.exactCorrect++; }

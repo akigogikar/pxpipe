@@ -19,9 +19,41 @@ fixed battery of questions against the image and scores the answers.
   - `5x8` — production density (`{cellWBonus:0, cellHBonus:0}`)
   - `7x10` — `{cellWBonus:2, cellHBonus:2}`
   - `9x12` — `{cellWBonus:4, cellHBonus:4}`
+  - `5x8+sharp` — production density **+ lever B** (below)
+  - `7x10+sharp` — larger cell **+ lever B**
   Each variant keeps the ≤1568×728 page cap, so images stay in Anthropic's
   linear-billing window (no server-side downscale) and page count rises as
   density drops.
+
+**Lever A (density)** trades savings for OCR fidelity on *everything*.
+**Lever B (content-aware keep-sharp, `+sharp`)** targets only the failure class:
+`src/core/sharp.ts` detects exact-string spans (hex/hash, UUID, file path, CLI
+flag, camel/snake identifier, port/long-number, URL) and lifts them out of the
+imaged body into a small **verbatim text sidecar** the model reads exactly —
+prose stays imaged, so savings are largely preserved. B mechanically guarantees
+correct recall for every *detected* span (it is text, not pixels); the residual
+risk is detector recall on real content, which the scored run + `tests/sharp.test.ts`
+measure. A and B compose.
+
+### Dry-run cost accounting (measured, no API key)
+
+`tsx run.mjs` with no `ANTHROPIC_API_KEY` prints the token math (savings gate #3).
+On the built-in fixture (baseline text = 1335 tok):
+
+| Variant | dims | img tok | sidecar | total | savings |
+|---|---|---|---|---|---|
+| `5x8` (prod, image-all) | 1568×128 | 280 | – | 280 | **79%** |
+| `7x10` (A) | 1562×228 | 504 | – | 504 | 62% |
+| `9x12` (A) | 1565×344 | 728 | – | 728 | 45% |
+| `5x8+sharp` (B) | 1568×120 | 280 | +56 (6 spans) | 336 | **75%** |
+| `7x10+sharp` (A+B) | 1562×198 | 448 | +56 (6 spans) | 504 | 62% |
+
+**Read:** B lifts all 6 exact-string spans to verbatim text for only ~4pp of
+savings (79→75%), vs A burning 17–34pp on a blunt cell enlargement. B is the
+high-leverage lever — it spends savings *only* on the content that actually
+breaks OCR. Final variant choice is **gated on the scored run** (gist==baseline,
+zero silent-wrong exact strings); enabling Opus in production stays out of scope
+until those numbers clear.
 - **Models:** `claude-opus-4-8`, `claude-fable-5` (both high-res tier).
 - **Tasks** (each answer committed before ground truth is revealed):
   1. exact 12-char hex recall
