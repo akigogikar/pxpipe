@@ -583,12 +583,12 @@ function foldGptHistory(
 
 export const CHAT_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and tool schema documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged schema is supplemental parameter documentation.' +
+  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and tool schema documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged schema is supplemental parameter documentation. Exact character-level strings (hex, ids, paths, code identifiers) are easy to misread from a rendered page; a bracketed identifier list after the images gives the precision-critical ones verbatim — quote from that list, and re-read the original source for any exact value not listed there rather than guess it from the pixels.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 export const RESPONSES_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain instructions and tool schema documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged schema is supplemental parameter documentation.' +
+  'These images were injected by pxpipe, not by the end user. They contain instructions and tool schema documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged schema is supplemental parameter documentation. Exact character-level strings (hex, ids, paths, code identifiers) are easy to misread from a rendered page; a bracketed identifier list after the images gives the precision-critical ones verbatim — quote from that list, and re-read the original source for any exact value not listed there rather than guess it from the pixels.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 export const CHAT_POINTER =

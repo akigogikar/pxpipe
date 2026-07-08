@@ -22,6 +22,7 @@ import {
   maxCharsPerImage,
   estimateImageCount,
   compactSlabWhitespace,
+  buildImageInstructionHeader,
   SLAB_CHARS_PER_TOKEN,
 } from '../src/core/transform.js';
 import { stripSchemaDescriptions } from '../src/core/schema-strip.js';
@@ -2384,5 +2385,56 @@ describe('colorByRole (structure-through slot string)', () => {
     // PNG IHDR colorType byte: sig(8) + len(4) + "IHDR"(4) + ihdr[9] = offset 25.
     expect(colored.png[25]).toBe(2); // 2 = truecolor RGB
     expect(plain.png[25]).toBe(0); // 0 = grayscale
+  });
+});
+
+describe('buildImageInstructionHeader — abstain framing (issue #31/#32)', () => {
+  it('tells the model to quote exact strings from the fact-sheet / re-read the source', () => {
+    const header = buildImageInstructionHeader(1, false);
+    // Abstain framing: point at the bracketed identifier list and prefer re-reading
+    // the source over guessing precision-critical strings from pixels.
+    expect(header).toContain('bracketed identifier list');
+    expect(header).toContain('quote from that list');
+    expect(header).toContain('re-read the original source');
+    expect(header).toContain('rather than guess');
+  });
+
+  it('never reintroduces "system prompt"/"authoritative" (trips reasoning_extraction refusal)', () => {
+    // A user-turn banner announcing a "SYSTEM PROMPT ... authoritative system
+    // instructions" reads as a replayed/extracted prompt (model-cloning heuristic)
+    // and forces a fallback-model switch. First-party provenance framing only.
+    for (const [cols, reflow] of [[1, false], [3, true], [2, false]] as const) {
+      const header = buildImageInstructionHeader(cols, reflow);
+      expect(header.toLowerCase()).not.toContain('system prompt');
+      expect(header.toLowerCase()).not.toContain('authoritative');
+    }
+  });
+
+  it('uses first-party provenance framing (pxpipe rendered this locally)', () => {
+    const header = buildImageInstructionHeader(1, false);
+    expect(header).toContain("pxpipe (this user's local proxy) rendered");
+    expect(header).toContain('SESSION CONFIGURATION PAGES');
+    expect(header).toContain('BEGIN RENDERED CONTEXT');
+  });
+
+  it('adds the multi-column reading order note only when numCols > 1', () => {
+    expect(buildImageInstructionHeader(1, false)).not.toContain('Multi-column layout');
+    const multi = buildImageInstructionHeader(3, false);
+    expect(multi).toContain('Multi-column layout (3 cols)');
+    expect(multi).toContain('read column 1 (leftmost) top-to-bottom');
+  });
+
+  it('adds the reflow ↵ glyph note only when reflow is enabled', () => {
+    expect(buildImageInstructionHeader(1, false)).not.toContain('U+21B5');
+    const reflowed = buildImageInstructionHeader(1, true);
+    expect(reflowed).toContain('↵ (U+21B5)');
+    expect(reflowed).toContain('treat as a real newline');
+  });
+
+  it('is a pure, stable function of (numCols, reflow) — byte-identical across calls', () => {
+    // The header sits in the cache prefix; identical inputs must yield identical
+    // bytes so the Anthropic prompt cache stays warm across turns.
+    expect(buildImageInstructionHeader(2, true)).toBe(buildImageInstructionHeader(2, true));
+    expect(buildImageInstructionHeader(1, false)).toBe(buildImageInstructionHeader(1, false));
   });
 });

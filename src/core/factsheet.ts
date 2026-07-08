@@ -30,6 +30,19 @@ const PATTERNS: readonly RegExp[] = [
   // Ticket/advisory-style codes: uppercase hyphenated with ≥1 digit (PROJ-1482,
   // CVE-2024-30078, AUDIT-ZX9). Digit lookahead is bounded → no backtracking blowup.
   /\b(?=[A-Z0-9-]{0,119}\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b/g,
+  // Multi-hump camelCase / PascalCase code identifiers (≥2 case-boundaries), e.g.
+  // `extractFactSheetTokens`, `tokenLedgerShard`, `FactSheetToken`. These are the
+  // exact residual OCR misses the sidecar didn't cover (`extractFactSheetTokens`
+  // read as `extractFactsheetTokens` — the S/s case-normalisation class; see
+  // docs/LEGIBILITY-AUDIT). Scoped to ≥2 humps so SINGLE-hump names (`getFoo`,
+  // `RecoverableBlock`) — abundant on a dense code page and reconstructable from
+  // context — never flood the 64-token budget. Both classes are lowercase-led per
+  // segment, so pure acronyms (`HTTP`, `JSON`) are excluded. The lead segment class
+  // (`[a-z0-9]`/`[a-z]`) is disjoint from the hump lead (`[A-Z]`) → strictly O(n),
+  // no backtracking. They fall to the default tier-1 in `priorityTier` (below the
+  // zero-redundancy SHA/num/flag tier-0), so they can never evict a critical token.
+  /\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*){2,}\b/g, // lowerCamelCase, ≥2 humps
+  /\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*){2,}\b/g, // UpperCamelCase, ≥2 more humps
 ];
 
 const MIN_LEN = 3;
