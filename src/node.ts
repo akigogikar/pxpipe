@@ -13,6 +13,8 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import { createMitmServer } from './core/mitm.js';
+import { ensureCa, checkCa, caCertPath, mitmDir, opensslAvailable } from './core/mitm-ca.js';
 import {
   parseExportArgv,
   runExportCore,
@@ -133,6 +135,7 @@ function printHelp(): void {
 Usage:
   pxpipe                run the proxy (no flags)
   pxpipe export [...]   render files/diff to PNG pages + cost report (see pxpipe export --help)
+  pxpipe mitm [...]     transparent CONNECT proxy for Claude Desktop (see pxpipe mitm --help)
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
@@ -868,9 +871,22 @@ async function main(): Promise<void> {
     await runExport(argv.slice(1));
     return; // server never starts
   }
+  if (argv[0] === 'mitm') {
+    await runMitm(argv.slice(1));
+    return; // mitm mode owns its own server lifecycle
+  }
   // No subcommands — pxpipe is just the proxy. Stats / sessions / cleanup
   // tools live in the dashboard (see http://127.0.0.1:${port}/).
   const opts = parseCli(argv);
+  await run(opts, 'plain');
+}
+
+/**
+ * Build the tracker + dashboard + proxy handler and start listening. Shared by
+ * the default base-URL mode ('plain') and the CONNECT-proxy mode ('mitm'); the
+ * ONLY difference is the listener that wraps the identical request handler.
+ */
+async function run(opts: RuntimeConfig, mode: 'plain' | 'mitm'): Promise<void> {
   // A/B harness passthrough switch (see the `transform` callback below).
   const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
   if (forcePassthrough) {
@@ -1029,7 +1045,7 @@ async function main(): Promise<void> {
   };
   const handle = createProxy(config);
 
-  const server = createServer((req, res) => {
+  const requestHandler = (req: IncomingMessage, res: ServerResponse): void => {
     Promise.resolve()
       .then(async () => {
         // Local dashboard routes — handled BEFORE the proxy so they never hit
@@ -1052,13 +1068,26 @@ async function main(): Promise<void> {
         if (!res.headersSent) res.statusCode = 500;
         res.end();
       });
-  });
+  };
+
+  // Plain mode is the base-URL reverse proxy. MITM mode is a CONNECT proxy that
+  // TLS-terminates api.anthropic.com with our own CA — the client points here
+  // via HTTPS_PROXY + NODE_EXTRA_CA_CERTS (see `pxpipe mitm install`). Both wrap
+  // the identical requestHandler, so transform/events/dashboard are unchanged.
+  if (mode === 'mitm') ensureCa();
+  const server = mode === 'mitm'
+    ? createMitmServer({ requestHandler })
+    : createServer(requestHandler);
 
   // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
   const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
   const isLoopbackHost =
     opts.host === '127.0.0.1' || opts.host === 'localhost' || opts.host === '::1';
   server.listen(opts.port, opts.host, () => {
+    if (mode === 'mitm') {
+      console.log(`[pxpipe] MITM CONNECT proxy on ${displayHost}:${opts.port} — TLS-terminating api.anthropic.com, tunnelling all else`);
+      console.log(`[pxpipe] trust this CA in the client (NODE_EXTRA_CA_CERTS): ${caCertPath()}`);
+    }
     console.log(`[pxpipe] listening on http://${displayHost}:${opts.port}`);
     if (!isLoopbackHost) {
       console.warn(
@@ -1105,6 +1134,217 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
+// ---- pxpipe mitm ----------------------------------------------------------
+
+const CLAUDE_SETTINGS = path.join(os.homedir(), '.claude', 'settings.json');
+const CLAUDE_SETTINGS_BAK = CLAUDE_SETTINGS + '.pxpipe.bak';
+const MITM_PROXY_URL = `http://127.0.0.1:${process.env.PORT ?? 47821}`;
+const LAUNCH_AGENT_LABEL = 'com.pxpipe.mitm';
+const LAUNCH_AGENT_PATH = path.join(
+  os.homedir(), 'Library', 'LaunchAgents', `${LAUNCH_AGENT_LABEL}.plist`,
+);
+
+function printMitmHelp(): void {
+  console.log(`pxpipe mitm — transparent CONNECT proxy (works with Claude Desktop)
+
+The default proxy needs ANTHROPIC_BASE_URL pointed at it, which Claude Desktop
+pins. mitm mode instead runs an HTTP CONNECT proxy the client reaches via
+HTTPS_PROXY: it TLS-terminates ONLY api.anthropic.com (with a local CA it
+generates) to compress Fable requests, and raw-tunnels every other host.
+
+Usage:
+  pxpipe mitm                run the CONNECT proxy (foreground)
+  pxpipe mitm install        generate CA, wire ~/.claude/settings.json, install a launchd keepalive
+  pxpipe mitm uninstall      revert settings.json + remove the launchd agent
+  pxpipe mitm doctor         check CA, settings.json wiring, and agent status
+  pxpipe mitm --help         this help
+
+install writes to ~/.claude/settings.json "env":
+  HTTPS_PROXY=${MITM_PROXY_URL}
+  NODE_EXTRA_CA_CERTS=<~/.pxpipe/mitm/ca.crt>
+and removes any ANTHROPIC_BASE_URL override (the two must not both be set).
+
+Security: mitm decrypts api.anthropic.com locally, so your API/OAuth token is
+visible in plaintext to this proxy (loopback only, never written to events).
+The CA signs only api.anthropic.com. Undo everything with \`pxpipe mitm uninstall\`.
+`);
+}
+
+async function runMitm(argv: string[]): Promise<void> {
+  const sub = argv[0];
+  if (sub === '-h' || sub === '--help' || sub === 'help') { printMitmHelp(); process.exit(0); }
+  if (sub === 'install') { mitmInstall(); return; }
+  if (sub === 'uninstall') { mitmUninstall(); return; }
+  if (sub === 'doctor') { mitmDoctor(); return; }
+  if (sub !== undefined) {
+    console.error(`[pxpipe mitm] unknown argument: ${sub}`);
+    console.error('[pxpipe mitm] try: pxpipe mitm [install|uninstall|doctor]  (or `pxpipe mitm --help`)');
+    process.exit(2);
+  }
+  // Default (no subcommand): run the CONNECT proxy in the foreground.
+  if (!opensslAvailable()) {
+    console.error('[pxpipe mitm] openssl not found on PATH — required to generate the local CA.');
+    process.exit(1);
+  }
+  await run(parseCli([]), 'mitm');
+}
+
+/** Idempotent, backup-preserving patch of ~/.claude/settings.json env. */
+function patchClaudeSettings(): void {
+  let cfg: Record<string, unknown> = {};
+  if (fs.existsSync(CLAUDE_SETTINGS)) {
+    // Preserve the PRISTINE settings on first patch only — never overwrite the
+    // backup with an already-patched file on a second install.
+    if (!fs.existsSync(CLAUDE_SETTINGS_BAK)) fs.copyFileSync(CLAUDE_SETTINGS, CLAUDE_SETTINGS_BAK);
+    try {
+      cfg = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS, 'utf8')) as Record<string, unknown>;
+    } catch (e) {
+      console.warn(
+        `[pxpipe mitm] ${CLAUDE_SETTINGS} is not valid JSON (${(e as Error).message}); ` +
+          'starting env from {} (backup kept)',
+      );
+      cfg = {};
+    }
+  }
+  const env = (cfg.env && typeof cfg.env === 'object' && !Array.isArray(cfg.env)
+    ? cfg.env
+    : {}) as Record<string, unknown>;
+  delete env.ANTHROPIC_BASE_URL; // retire the base-URL reverse-proxy override
+  env.HTTPS_PROXY = MITM_PROXY_URL;
+  env.HTTP_PROXY = MITM_PROXY_URL;
+  env.NODE_EXTRA_CA_CERTS = caCertPath();
+  // Only api.anthropic.com should route through us. Exclude loopback so local
+  // tools inherited by the session (Ollama/distill, other MCP servers, local
+  // dashboards) are NOT proxied into this MITM and broken.
+  env.NO_PROXY = 'localhost,127.0.0.1,::1';
+  env.no_proxy = 'localhost,127.0.0.1,::1';
+  cfg.env = env;
+  fs.mkdirSync(path.dirname(CLAUDE_SETTINGS), { recursive: true });
+  fs.writeFileSync(CLAUDE_SETTINGS, JSON.stringify(cfg, null, 2) + '\n');
+}
+
+function installLaunchAgent(): void {
+  if (process.platform !== 'darwin') {
+    console.log(
+      '[pxpipe mitm] non-macOS: skipping launchd agent — run `pxpipe mitm` under your own supervisor (systemd, etc.).',
+    );
+    return;
+  }
+  const logPath = path.join(mitmDir(), '..', 'mitm.log'); // ~/.pxpipe/mitm.log
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LAUNCH_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${process.execPath}</string>
+    <string>${process.argv[1]}</string>
+    <string>mitm</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${logPath}</string>
+  <key>StandardErrorPath</key><string>${logPath}</string>
+</dict>
+</plist>
+`;
+  fs.mkdirSync(path.dirname(LAUNCH_AGENT_PATH), { recursive: true });
+  fs.writeFileSync(LAUNCH_AGENT_PATH, plist);
+  spawnSync('launchctl', ['unload', LAUNCH_AGENT_PATH], { stdio: 'ignore' });
+  spawnSync('launchctl', ['load', LAUNCH_AGENT_PATH], { stdio: 'ignore' });
+}
+
+function mitmInstall(): void {
+  if (!opensslAvailable()) {
+    console.error('[pxpipe mitm] openssl not found on PATH — required to generate the local CA.');
+    process.exit(1);
+  }
+  const material = ensureCa();
+  patchClaudeSettings();
+  installLaunchAgent();
+  console.log('[pxpipe mitm] installed.');
+  console.log(`  CA:            ${material.caCertPath}`);
+  console.log(
+    `  settings.json: ${CLAUDE_SETTINGS} (HTTPS_PROXY + NODE_EXTRA_CA_CERTS set; ` +
+      `ANTHROPIC_BASE_URL removed; backup at ${path.basename(CLAUDE_SETTINGS_BAK)})`,
+  );
+  if (process.platform === 'darwin') {
+    console.log(`  launchd:       ${LAUNCH_AGENT_PATH} (RunAtLoad + KeepAlive)`);
+  }
+  console.log('');
+  console.log('  If you previously ran a base-URL pxpipe launchd agent, unload it so the two');
+  console.log('  do not fight over the port:  launchctl bootout gui/$(id -u)/<its-label>');
+  console.log('');
+  console.log('  Next: fully quit and reopen Claude Desktop, run a Fable task, and watch');
+  console.log(`        ${MITM_PROXY_URL}/  — compressed events should appear.`);
+  console.log('  Undo: pxpipe mitm uninstall');
+}
+
+function mitmUninstall(): void {
+  if (fs.existsSync(CLAUDE_SETTINGS_BAK)) {
+    fs.copyFileSync(CLAUDE_SETTINGS_BAK, CLAUDE_SETTINGS);
+    fs.rmSync(CLAUDE_SETTINGS_BAK, { force: true });
+    console.log(`[pxpipe mitm] restored ${CLAUDE_SETTINGS} from backup`);
+  } else if (fs.existsSync(CLAUDE_SETTINGS)) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS, 'utf8')) as Record<string, unknown>;
+      const env = cfg.env as Record<string, unknown> | undefined;
+      if (env) {
+        delete env.HTTPS_PROXY;
+        delete env.HTTP_PROXY;
+        delete env.NODE_EXTRA_CA_CERTS;
+        delete env.NO_PROXY;
+        delete env.no_proxy;
+      }
+      fs.writeFileSync(CLAUDE_SETTINGS, JSON.stringify(cfg, null, 2) + '\n');
+      console.log(`[pxpipe mitm] removed proxy keys from ${CLAUDE_SETTINGS}`);
+    } catch {
+      /* leave as-is */
+    }
+  }
+  if (process.platform === 'darwin' && fs.existsSync(LAUNCH_AGENT_PATH)) {
+    spawnSync('launchctl', ['unload', LAUNCH_AGENT_PATH], { stdio: 'ignore' });
+    fs.rmSync(LAUNCH_AGENT_PATH, { force: true });
+    console.log(`[pxpipe mitm] removed launchd agent ${LAUNCH_AGENT_PATH}`);
+  }
+  console.log(
+    `[pxpipe mitm] uninstalled. Restart Claude Desktop. ` +
+      `(CA left at ${mitmDir()} — delete it to fully remove trust.)`,
+  );
+}
+
+function mitmDoctor(): void {
+  console.log('[pxpipe mitm] doctor');
+  console.log(`  openssl:       ${opensslAvailable() ? 'ok' : 'MISSING (required)'}`);
+  const caMsg = checkCa();
+  console.log(`  CA material:   ${caMsg ?? `ok (${caCertPath()})`}`);
+  let wired: string;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS, 'utf8')) as Record<string, unknown>;
+    const env = (cfg.env ?? {}) as Record<string, unknown>;
+    const okProxy = env.HTTPS_PROXY === MITM_PROXY_URL;
+    const okCa = env.NODE_EXTRA_CA_CERTS === caCertPath();
+    const baseWarn = env.ANTHROPIC_BASE_URL
+      ? `  WARNING: ANTHROPIC_BASE_URL still set (${String(env.ANTHROPIC_BASE_URL)})`
+      : '';
+    wired =
+      (okProxy && okCa
+        ? 'ok'
+        : `HTTPS_PROXY=${String(env.HTTPS_PROXY ?? 'unset')} NODE_EXTRA_CA_CERTS=${String(env.NODE_EXTRA_CA_CERTS ?? 'unset')}`) +
+      baseWarn;
+  } catch {
+    wired = `cannot read ${CLAUDE_SETTINGS}`;
+  }
+  console.log(`  settings.json: ${wired}`);
+  if (process.platform === 'darwin') {
+    const loaded = spawnSync('launchctl', ['list', LAUNCH_AGENT_LABEL], { encoding: 'utf8' }).status === 0;
+    console.log(`  launchd agent: ${loaded ? 'loaded' : 'not loaded'} (${LAUNCH_AGENT_PATH})`);
+  }
+}
+
+// Entry point invoked LAST, after every module-level const above is initialized
+// — main() runs synchronously into the mitm subcommands, which read those consts.
 main().catch((err) => {
   console.error('[pxpipe] fatal:', err);
   process.exit(1);

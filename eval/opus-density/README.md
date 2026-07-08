@@ -19,9 +19,94 @@ fixed battery of questions against the image and scores the answers.
   - `5x8` — production density (`{cellWBonus:0, cellHBonus:0}`)
   - `7x10` — `{cellWBonus:2, cellHBonus:2}`
   - `9x12` — `{cellWBonus:4, cellHBonus:4}`
+  - `5x8+sharp` — production density **+ lever B** (below)
+  - `7x10+sharp` — larger cell **+ lever B**
   Each variant keeps the ≤1568×728 page cap, so images stay in Anthropic's
   linear-billing window (no server-side downscale) and page count rises as
   density drops.
+
+**Lever A (density)** trades savings for OCR fidelity on *everything*.
+**Lever B (content-aware keep-sharp, `+sharp`)** targets only the failure class:
+`src/core/sharp.ts` detects exact-string spans (hex/hash, UUID, file path, CLI
+flag, camel/snake identifier, port/long-number, URL) and lifts them out of the
+imaged body into a small **verbatim text sidecar** the model reads exactly —
+prose stays imaged, so savings are largely preserved. B mechanically guarantees
+correct recall for every *detected* span (it is text, not pixels); the residual
+risk is detector recall on real content, which the scored run + `tests/sharp.test.ts`
+measure. A and B compose.
+
+### Dry-run cost accounting (measured, no API key)
+
+`tsx run.mjs` with no `ANTHROPIC_API_KEY` prints the token math (savings gate #3).
+On the built-in fixture (baseline text = 1335 tok):
+
+| Variant | dims | img tok | sidecar | total | savings |
+|---|---|---|---|---|---|
+| `5x8` (prod, image-all) | 1568×128 | 280 | – | 280 | **79%** |
+| `7x10` (A) | 1562×228 | 504 | – | 504 | 62% |
+| `9x12` (A) | 1565×344 | 728 | – | 728 | 45% |
+| `5x8+sharp` (B) | 1568×120 | 280 | +56 (6 spans) | 336 | **75%** |
+| `7x10+sharp` (A+B) | 1562×198 | 448 | +56 (6 spans) | 504 | 62% |
+
+**Read:** B lifts all 6 exact-string spans to verbatim text for only ~4pp of
+savings (79→75%), vs A burning 17–34pp on a blunt cell enlargement. B is the
+high-leverage lever — it spends savings *only* on the content that actually
+breaks OCR. Final variant choice is **gated on the scored run** (gist==baseline,
+zero silent-wrong exact strings); enabling Opus in production stays out of scope
+until those numbers clear.
+
+### Lever C — font legibility (`eval/glyph-confusability/`)
+
+A/B trade savings for OCR fidelity or spend tokens on a sidecar. **C is
+different: it can raise recall at the SAME cell size and SAME token cost**, so
+any gain it buys is spendable as more density — the only lever with upside on
+Fable, which already reads 5×8 fine.
+
+`analyze.mjs` decodes the real production Spleen 5×8 atlas (+ the pre-built
+AA-gray atlas), simulates the vision encoder's low-pass (3×3 blur), and ranks
+glyph pairs by post-blur shape distance — a proxy, not ground truth, but
+API-key-free and immediately actionable. Findings on the shipping font:
+
+- **AA is a no-op for code glyphs.** ASCII glyphs in `atlas-gray.ts` are pure
+  `{0,255}` — zero fractional coverage (AA only touches CJK/symbol fallback).
+  The token-free AA sub-lever buys nothing for hex/code recall; don't score it.
+- **20/40 classic confusable classes flagged RISK**, dominated by exactly the
+  dense-hex failure set: `8~B`=.019, `0~O`=.016, `5~S`=.023, `2~Z`=.043,
+  `6~G`=.061. Scoped to ~15 glyphs.
+
+`harden.mjs` prototypes hand-designed pixel patches for the worst offenders and
+re-scans the **full alphabet** (not just the target pairs) to catch
+side-effects. Result — a real negative finding:
+
+| glyph | technique | target Δ | side effects |
+|---|---|---|---|
+| `2` | break an accidental shared pixel with `Z` | **+0.0121** | none |
+| `5` | break an accidental shared pixel with `S` | **+0.0160** | none |
+| `0` | round 1: bolden (bigger center dot) | +0.0043 | 2 new worst-24 collisions (`0~8`, `0~9`) — reverted |
+| `0` | round 2: de-collide (remove diagonal, add 1px elsewhere) | **−0.0081 worse** | net *reduced* the 0-vs-O distinguishing pixel count (2→1) — arithmetic error, reverted |
+| `B` | bolden (wider bars) | **−0.0026 worse** | broad convergence toward every boxy capital; `B~O` crashed to 0.0196 — reverted, no de-collision move exists (no shared row with `8` to exploit) |
+| `G` | round 1: bolden (bigger crossbar) | ~0 | broad convergence, same failure as `B` — reverted |
+| `G` | round 2: de-collide (same edit shape that worked for `5`) | **−0.0124 worse** | drifted closer to a dozen+ unrelated letters (B,E,M,N,P,R,...) — reverted |
+
+**Mechanism (round 1):** at 5×8 + blur + cosine-distance, adding ink pushes a
+glyph toward a generic dense blob that *other* bold capitals also blur into —
+distance to the one target improves (maybe) while distance to everything else
+shrinks. The de-collision technique (relocate/remove a pixel the partner
+shares by coincidence, don't add mass) fixed this for `2`/`5`.
+
+**Round 2 finding:** de-collision does not mechanically generalize. Applying
+the *identical* technique to `0`/`G` failed for two different reasons — `0`'s
+fix accidentally reduced its own distinguishing-pixel budget (a design
+arithmetic error), and `G`'s fix (reusing `5`'s exact successful edit shape)
+still caused broad drift because `0` and `6`/`G` sit in a denser neighborhood
+of similarly-shaped glyphs than the more isolated `2`/`Z` and `5`/`S` pairs. So
+only `2` and `5` are validated after 2 rounds; `0`, `6`/`G`, `8`/`B` are left
+unpatched pending real font-design tooling (out of scope for blind pixel
+patches) rather than a third guess.
+
+Both scripts are offline (no `ANTHROPIC_API_KEY`, `pnpm exec tsx <script>.mjs`)
+and exist to cheaply screen candidates before spending a scored run on them —
+they do not replace the acceptance bar above.
 - **Models:** `claude-opus-4-8`, `claude-fable-5` (both high-res tier).
 - **Tasks** (each answer committed before ground truth is revealed):
   1. exact 12-char hex recall

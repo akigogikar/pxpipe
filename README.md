@@ -55,6 +55,26 @@ normally — pxpipe compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
+## Claude Desktop (`pxpipe mitm`)
+
+Claude Desktop pins `ANTHROPIC_BASE_URL`, so the base-URL proxy above can't see
+its traffic. `mitm` mode instead runs a local HTTP CONNECT proxy that
+TLS-terminates **only** `api.anthropic.com` (with a CA it generates in
+`~/.pxpipe/mitm/`) and raw-tunnels every other host untouched:
+
+```bash
+pxpipe mitm install     # generate CA, wire ~/.claude/settings.json, add a launchd keepalive
+# fully quit + reopen Claude Desktop, run a Fable task, watch http://127.0.0.1:47821/
+pxpipe mitm uninstall   # revert everything
+```
+
+`install` sets `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` in the `env` block of
+`~/.claude/settings.json` (which Desktop leaves free) and removes any
+`ANTHROPIC_BASE_URL` override. Because mitm decrypts `api.anthropic.com`
+locally, your API/OAuth token is visible in plaintext to the proxy (loopback
+only, never written to `events.jsonl`). The CA signs only `api.anthropic.com`.
+`pxpipe mitm doctor` checks the wiring.
+
 ## The honest part
 
 - **It is lossy.** Exact 12-char hex strings in dense imaged content:

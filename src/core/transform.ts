@@ -680,6 +680,25 @@ function extractSystemText(
   };
 }
 
+/**
+ * Strip cache_control.scope (e.g. "global") from a marker pxpipe RELOCATES onto
+ * an image block. `scope: "global"` requires every preceding block to also be
+ * global, but pxpipe moves the marker into a user-message image block that sits
+ * after tools+system — breaking that prefix invariant (Anthropic 400s it). This
+ * surfaces on transparent/MITM traffic, where Claude Code enables scoped caching
+ * that it withholds when pointed at a custom base URL. Global-scope semantics
+ * can't survive imaging anyway, so downgrade to the default ephemeral scope.
+ * No-op when there is no scope field.
+ */
+function stripCacheScope<T>(cc: T): T {
+  if (cc && typeof cc === 'object' && 'scope' in (cc as Record<string, unknown>)) {
+    const rest = { ...(cc as Record<string, unknown>) };
+    delete rest.scope;
+    return rest as T;
+  }
+  return cc;
+}
+
 function lastStaticSystemCacheControl(sys: SystemField | undefined): TextBlock['cache_control'] | undefined {
   if (!Array.isArray(sys)) return undefined;
   let cacheControl: TextBlock['cache_control'] | undefined;
@@ -927,7 +946,7 @@ function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrd
   }
   if (!slabAnchor) return; // nothing to relocate → never add a marker
 
-  historyImg.cache_control = slabAnchor.cache_control;
+  historyImg.cache_control = stripCacheScope(slabAnchor.cache_control);
   delete slabAnchor.cache_control;
 }
 
@@ -1800,7 +1819,7 @@ export async function transformRequest(
     const imageBlock = makeImageBlock(b64, i === images.length - 1);
     imageBlocks.push(
       i === images.length - 1 && systemStaticCacheControl !== undefined
-        ? { ...imageBlock, cache_control: systemStaticCacheControl }
+        ? { ...imageBlock, cache_control: stripCacheScope(systemStaticCacheControl) }
         : imageBlock,
     );
   }
@@ -1913,7 +1932,7 @@ export async function transformRequest(
             const img = imgs[i]!;
             const out =
               i === imgs.length - 1 && srcCacheControl !== undefined
-                ? { ...img, cache_control: srcCacheControl }
+                ? { ...img, cache_control: stripCacheScope(srcCacheControl) }
                 : img;
             processedExisting.push(out as ImageBlock);
             info.imageBytes += approxBlockBytes(img);
@@ -2062,7 +2081,7 @@ export async function transformRequest(
                   const img = imgs[i]!;
                   const out =
                     i === imgs.length - 1 && srcCacheControl !== undefined
-                      ? { ...img, cache_control: srcCacheControl }
+                      ? { ...img, cache_control: stripCacheScope(srcCacheControl) }
                       : img;
                   newInner.push(out as ImageBlock);
                   info.imageBytes += approxBlockBytes(img);
