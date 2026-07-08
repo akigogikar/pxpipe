@@ -4,13 +4,25 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 // End-to-end coverage of the real `pxpipe export --git` path (the bug PR-4 fixed
 // was in collectSource's untracked branch, not in the readExportTextFile helper).
 // Runs the actual CLI via tsx against a throwaway git repo and asserts the
 // untracked-file filtering. Kept in its own file because it spawns a subprocess.
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const tsxBin = path.join(repoRoot, 'node_modules', '.bin', 'tsx');
+// Resolve tsx's CLI entry through Node module resolution rather than a hardcoded
+// `${repoRoot}/node_modules/.bin/tsx`. In a git worktree the worktree-local
+// node_modules is empty (deps hoist to the main checkout), so the .bin path never
+// exists there — resolving the package walks up the tree and finds it. Read the
+// bin from tsx's own package.json so it stays correct across tsx versions.
+const require = createRequire(import.meta.url);
+const tsxPkgPath = require.resolve('tsx/package.json');
+const tsxPkg = JSON.parse(fs.readFileSync(tsxPkgPath, 'utf8')) as { bin: string | Record<string, string> };
+const tsxCli = path.join(
+  path.dirname(tsxPkgPath),
+  typeof tsxPkg.bin === 'string' ? tsxPkg.bin : tsxPkg.bin.tsx,
+);
 
 function git(cwd: string, args: string[]): void {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -43,8 +55,8 @@ describe('pxpipe export --git (end-to-end)', () => {
 
   it('applies --include, the size cap, and the binary sniff to untracked files', () => {
     const run = spawnSync(
-      tsxBin,
-      ['src/node.ts', 'export', '--git', repo, '--include', '*.ts', '--out', outDir, '--json'],
+      process.execPath,
+      [tsxCli, 'src/node.ts', 'export', '--git', repo, '--include', '*.ts', '--out', outDir, '--json'],
       { cwd: repoRoot, encoding: 'utf8', timeout: 120_000 },
     );
     expect(run.status, `stderr:\n${run.stderr}`).toBe(0);
