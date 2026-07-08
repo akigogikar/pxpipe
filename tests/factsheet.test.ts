@@ -150,3 +150,33 @@ describe('ticket-style codes and occurrence counts', () => {
   });
 
 });
+
+describe('camelCase / PascalCase code identifiers (issue #33/#34)', () => {
+  it('captures multi-hump camelCase identifiers verbatim', () => {
+    // The exact residual OCR miss the sidecar research surfaced: dense code pages
+    // read `extractFactSheetTokens` as `extractFactsheetTokens` (the S/s case-
+    // normalisation class). Anchoring the verbatim spelling in the fact-sheet is
+    // the fix — the model quotes the case-correct string instead of re-casing it.
+    const toks = extractFactSheetTokens(
+      'call extractFactSheetTokens then tokenLedgerShard to build the ImageSlabRenderer',
+    );
+    expect(toks).toContain('extractFactSheetTokens');
+    expect(toks).toContain('tokenLedgerShard');
+    expect(toks).toContain('ImageSlabRenderer');
+  });
+
+  it('does not flag single-hump names (getFoo, RecoverableBlock)', () => {
+    // Scoped to ≥2 case-boundaries: single-hump names are abundant on a dense
+    // code page and trivially reconstructable, so imaging them wastes budget.
+    const toks = extractFactSheetTokens('getFoo returns a RecoverableBlock for setBar');
+    expect(toks).not.toContain('getFoo');
+    expect(toks).not.toContain('RecoverableBlock');
+    expect(toks).not.toContain('setBar');
+  });
+
+  it('does not flag ordinary words or single capitalised words', () => {
+    const toks = extractFactSheetTokens('The Renderer parses ordinary sentences here');
+    expect(toks).not.toContain('Renderer');
+    expect(toks).not.toContain('The');
+  });
+});

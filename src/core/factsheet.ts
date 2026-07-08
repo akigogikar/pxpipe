@@ -27,13 +27,25 @@ const PATTERNS: readonly RegExp[] = [
   /\b\d[\d,_]{3,}\b/g, // large / separated number
   /\b\d+\.\d+\b/g, // decimal
   /\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b/g, // CONST_IDS / env var names
-  // camelCase / PascalCase with ≥1 lowercase run and ≥1 internal capital
-  // (tokenLedgerShard, getUserById). Rejects ALL-CAPS words so history markers
-  // like CURRENT/FRONTIER do not flood the sheet.
-  /\b(?:[a-z]+|[A-Z][a-z0-9]+)(?:[A-Z][a-z0-9]*)+\b/g,
+  // NOTE: an earlier broad camelCase pattern (≥1 internal capital, added as a
+  // drive-by in 5eb80a4) was superseded by the ≥2-hump scoping below (8b5f137):
+  // single-hump names (`getFoo`) flooded the 64-token budget on dense code pages.
   // Ticket/advisory-style codes: uppercase hyphenated with ≥1 digit (PROJ-1482,
   // CVE-2024-30078, AUDIT-ZX9). Digit lookahead is bounded → no backtracking blowup.
   /\b(?=[A-Z0-9-]{0,119}\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b/g,
+  // Multi-hump camelCase / PascalCase code identifiers (≥2 case-boundaries), e.g.
+  // `extractFactSheetTokens`, `tokenLedgerShard`, `FactSheetToken`. These are the
+  // exact residual OCR misses the sidecar didn't cover (`extractFactSheetTokens`
+  // read as `extractFactsheetTokens` — the S/s case-normalisation class; see
+  // docs/LEGIBILITY-AUDIT). Scoped to ≥2 humps so SINGLE-hump names (`getFoo`,
+  // `RecoverableBlock`) — abundant on a dense code page and reconstructable from
+  // context — never flood the 64-token budget. Both classes are lowercase-led per
+  // segment, so pure acronyms (`HTTP`, `JSON`) are excluded. The lead segment class
+  // (`[a-z0-9]`/`[a-z]`) is disjoint from the hump lead (`[A-Z]`) → strictly O(n),
+  // no backtracking. They fall to the default tier-1 in `priorityTier` (below the
+  // zero-redundancy SHA/num/flag tier-0), so they can never evict a critical token.
+  /\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*){2,}\b/g, // lowerCamelCase, ≥2 humps
+  /\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*){2,}\b/g, // UpperCamelCase, ≥2 more humps
 ];
 
 const MIN_LEN = 3;

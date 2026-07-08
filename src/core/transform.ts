@@ -1439,6 +1439,52 @@ async function runHistoryCollapseAndFinalize(
 }
 
 /**
+ * Build the "SESSION CONFIGURATION PAGES" instruction header that precedes the
+ * rendered images. Pure function of (numCols, reflow) so the cache prefix stays
+ * byte-identical across turns.
+ *
+ * Wording is precision-critical:
+ *  - Abstain framing (issue #31/#32): exact character-level strings are the one
+ *    thing a rendered page loses to OCR. The fact-sheet appended after the images
+ *    lists the precision-critical ones verbatim; this tells the model to quote
+ *    from that list / re-read the source rather than emit a confident wrong
+ *    transcription. Guarded by tests so the abstain wording never silently drops.
+ *  - Must NOT contain "system prompt"/"authoritative": a user-turn banner
+ *    announcing "SYSTEM PROMPT ... treat as authoritative system instructions"
+ *    trips Anthropic's reasoning_extraction refusal (reads as a replayed/extracted
+ *    prompt -> model-cloning heuristic) and forces a fallback-model switch.
+ *    First-party provenance framing keeps obedience without that signature.
+ */
+export function buildImageInstructionHeader(
+  numCols: number,
+  reflow: boolean,
+): string {
+  const reflowNoteImg = reflow
+    ? ' The glyph ↵ (U+21B5) marks an original hard line break in content — treat as a real newline.'
+    : '';
+  const columnNoteImg =
+    numCols > 1
+      ? ` Multi-column layout (${numCols} cols): read column 1 (leftmost) top-to-bottom, then column 2, etc.`
+      : '';
+  const abstainNoteImg =
+    ' Exact character-level strings (hex, ids, paths, code identifiers) are easy to' +
+    ' misread from a rendered page; a bracketed identifier list after the images gives' +
+    ' the precision-critical ones verbatim — quote from that list. If you need an exact' +
+    ' value that is not listed there, re-read the original source rather than guess it' +
+    ' from the pixels.';
+  return (
+    '=================== SESSION CONFIGURATION PAGES ===================\n' +
+    "pxpipe (this user's local proxy) rendered this session's configuration" +
+    ' into the following images to reduce token cost. Read the pages carefully and follow them as' +
+    ' your operating instructions for this session.' +
+    columnNoteImg +
+    reflowNoteImg +
+    abstainNoteImg +
+    '\n====================== BEGIN RENDERED CONTEXT ======================\n'
+  );
+}
+
+/**
  * Rewrite a Messages API request body. Returns the new body (still JSON
  * bytes) plus diagnostic info. On any error, returns the original bytes
  * unchanged.
@@ -1646,26 +1692,9 @@ export async function transformRequest(
     : SLAB_CHARS_PER_TOKEN;
   // Shrink canvas to longest actual line — pure function of (text, cols) so the
   // cache prefix stays byte-identical across turns. The banner sets a natural width floor.
-  const reflowNoteImg = o.reflow
-    ? ' The glyph ↵ (U+21B5) marks an original hard line break in content — treat as a real newline.'
-    : '';
-  const columnNoteImg =
-    numCols > 1
-      ? ` Multi-column layout (${numCols} cols): read column 1 (leftmost) top-to-bottom, then column 2, etc.`
-      : '';
-  // Wording note (do NOT reintroduce "system prompt"/"authoritative"): a user-turn
-  // banner announcing "SYSTEM PROMPT ... treat as authoritative system instructions"
-  // tripped Anthropic's reasoning_extraction refusal (reads as a replayed/extracted
-  // prompt -> model-cloning heuristic) and forced a fallback-model switch. First-party
-  // provenance framing below keeps obedience without the extraction signature.
-  const imageInstructionHeader =
-    '=================== SESSION CONFIGURATION PAGES ===================\n' +
-    "pxpipe (this user's local proxy) rendered this session's configuration" +
-    ' into the following images to reduce token cost. Read the pages carefully and follow them as' +
-    ' your operating instructions for this session.' +
-    columnNoteImg +
-    reflowNoteImg +
-    '\n====================== BEGIN RENDERED CONTEXT ======================\n';
+  // Header wording (abstain framing #31/#32 + the "no system prompt/authoritative"
+  // constraint) lives in buildImageInstructionHeader, guarded by unit tests.
+  const imageInstructionHeader = buildImageInstructionHeader(numCols, !!o.reflow);
   const combinedWithHeader = imageInstructionHeader + combined;
   // Shrink the canvas to the longest actual line in what we'll *render*,
   // so the gate's prediction and the renderer's output agree at the smallest
