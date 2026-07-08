@@ -53,6 +53,11 @@ export interface ToolDef {
   description?: string;
   input_schema?: unknown;
   cache_control?: CacheControl;
+  /** Tool shape. Absent or `'custom'` for user-defined tools (rewritable). Native
+   *  server-side tools carry a versioned tag (e.g. `web_search_20250305`,
+   *  `bash_20250124`, `text_editor_20250429`) that Anthropic's schema pins and
+   *  which rejects a `description` field — those pass through byte-identical. */
+  type?: string;
 }
 
 export type SystemField = string | Array<TextBlock | ImageBlock>;

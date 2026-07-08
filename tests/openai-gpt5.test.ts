@@ -4,7 +4,16 @@
  */
 import { describe, expect, it } from 'vitest';
 import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
-import { openAIVisionTokens, resolveVisionCost, transformOpenAIChatCompletions, transformOpenAIResponses } from '../src/core/openai.js';
+import {
+  CHAT_HEADER,
+  CHAT_POINTER,
+  RESPONSES_HEADER,
+  RESPONSES_POINTER,
+  openAIVisionTokens,
+  resolveVisionCost,
+  transformOpenAIChatCompletions,
+  transformOpenAIResponses,
+} from '../src/core/openai.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -69,9 +78,15 @@ describe('openAIVisionTokens', () => {
 // ── Task 2c + 3: Chat Completions transformer ────────────────────────────────
 
 const BIG_SYSTEM = 'System instruction with lots of detail. '.repeat(500); // ~20k chars
-const BIG_TOOL_DESC = 'Tool description with lots of context. '.repeat(200); // ~8k chars
-const CHAT_TOOL_PARAMS = { type: 'object', description: 'Param root.', properties: { x: { type: 'string', description: 'x param' } } };
-const CHAT_TOOL_DOC = `## Tool: do_thing\n${BIG_TOOL_DESC}\n\`\`\`json\n${JSON.stringify(CHAT_TOOL_PARAMS)}\n\`\`\``;
+// The tool `description` stays NATIVE on the GPT path (#18/#19) — imaging it would
+// double-bill (native text + image pixels). What pxpipe actually strips-and-images
+// is the schema *annotations*, so those must be what pads the slab. Make them large
+// enough that imaging the stripped schema is profitable WITHOUT the description.
+const BIG_TOOL_DESC = 'Tool description with lots of context. '.repeat(200); // ~8k chars — kept native, never imaged
+const BIG_SCHEMA_ANNO = 'Verbose parameter schema annotation moved into the image. '.repeat(200); // ~11k chars
+const CHAT_TOOL_PARAMS = { type: 'object', description: `Param root. ${BIG_SCHEMA_ANNO}`, properties: { x: { type: 'string', description: `x param. ${BIG_SCHEMA_ANNO}` } } };
+// Imaged doc = heading + full (unstripped) schema — NO description (that rides natively).
+const CHAT_TOOL_DOC = `## Tool: do_thing\n\`\`\`json\n${JSON.stringify(CHAT_TOOL_PARAMS)}\n\`\`\``;
 
 // Real `task`/`question` tools have a required parameter literally NAMED `description`
 // (others collide with `title`/`default`). The strip must drop the annotation but KEEP
@@ -82,9 +97,11 @@ const CHAT_TOOL_DOC = `## Tool: do_thing\n${BIG_TOOL_DESC}\n\`\`\`json\n${JSON.s
 const TASK_LIKE_PARAMS = {
   type: 'object',
   properties: {
-    description: { type: 'string', description: 'A short (3-5 words) description of the task' },
-    prompt: { type: 'string', description: 'The task for the agent to perform' },
-    title: { type: 'string', description: 'Property name collides with the title keyword' },
+    // Annotations padded so the stripped schema is profitable to image on its own
+    // (the native tool description no longer pads the slab — see BIG_SCHEMA_ANNO).
+    description: { type: 'string', description: `A short (3-5 words) description of the task. ${BIG_SCHEMA_ANNO}` },
+    prompt: { type: 'string', description: `The task for the agent to perform. ${BIG_SCHEMA_ANNO}` },
+    title: { type: 'string', description: `Property name collides with the title keyword. ${BIG_SCHEMA_ANNO}` },
   },
   required: ['description', 'prompt'],
   additionalProperties: false,
@@ -204,12 +221,75 @@ describe('transformOpenAIChatCompletions (gpt-5.6)', () => {
   });
 });
 
+// ── #18/#19: don't double-bill the GPT tool description ──────────────────────
+// The GPT path keeps each tool's `description` NATIVE (only schema annotations are
+// stripped-and-imaged). So the description must never appear in the imaged slab —
+// imaging it would bill it twice (native text + image pixels) while the savings
+// baseline credits only the stripped-schema delta. The injected header/pointer must
+// also tell the model the native tools[] already carry name + description.
+describe('#18/#19 GPT tool-doc dedupe — description stays native, never imaged', () => {
+  it('headers + pointers say tools carry name+description natively; imaged schema is supplemental', () => {
+    for (const h of [CHAT_HEADER, RESPONSES_HEADER]) {
+      expect(h).toContain('name and description');
+      expect(h).toContain('supplemental parameter documentation');
+      // Must NOT claim the full tool doc (which would include the description) is imaged.
+      expect(h).not.toContain('full tool/schema documentation');
+    }
+    for (const p of [CHAT_POINTER, RESPONSES_POINTER]) {
+      expect(p).toContain('name + description');
+      expect(p).toContain('schema is supplemental');
+    }
+  });
+
+  it('Chat: imaged slab excludes the description; native tools[] keeps it verbatim', async () => {
+    const SENTINEL = 'UNIQUE-CHAT-DESCRIPTION-SENTINEL-9f2c ' + 'padding '.repeat(50);
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6',
+      messages: [{ role: 'user', content: 'hello' }],
+      tools: [{ type: 'function', function: { name: 'do_thing', description: SENTINEL, parameters: CHAT_TOOL_PARAMS } }],
+    }));
+
+    const result = await transformOpenAIChatCompletions(body, { charsPerToken: 1, minCompressChars: 1 });
+    expect(result.info.compressed).toBe(true);
+    // Imaged slab is exactly heading + schema — the description length is NOT in it.
+    expect(result.info.origChars).toBe(CHAT_TOOL_DOC.length);
+    expect(result.info.origChars).toBeLessThan(CHAT_TOOL_DOC.length + SENTINEL.length);
+
+    const out = JSON.parse(dec.decode(result.body)) as any;
+    // Description survives natively (the whole point — no double-bill).
+    expect(out.tools[0].function.description).toBe(SENTINEL);
+    // Only the schema annotations were stripped from native (they ride in the image).
+    expect(out.tools[0].function.parameters.description).toBeUndefined();
+    expect(out.tools[0].function.parameters.properties.x.description).toBeUndefined();
+  });
+
+  it('Responses: imaged slab excludes the description; native tools[] keeps it verbatim', async () => {
+    const SENTINEL = 'UNIQUE-RESPONSES-DESCRIPTION-SENTINEL-3ab7 ' + 'padding '.repeat(50);
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6',
+      input: [{ role: 'user', content: 'hello' }],
+      tools: [{ type: 'function', name: 'do_thing', description: SENTINEL, parameters: RESPONSES_TOOL_PARAMS }],
+    }));
+
+    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.origChars).toBe(RESPONSES_TOOL_DOC.length);
+    expect(result.info.origChars).toBeLessThan(RESPONSES_TOOL_DOC.length + SENTINEL.length);
+
+    const out = JSON.parse(dec.decode(result.body)) as any;
+    expect(out.tools[0].description).toBe(SENTINEL);
+    expect(out.tools[0].parameters.description).toBeUndefined();
+    expect(out.tools[0].parameters.properties.x.description).toBeUndefined();
+  });
+});
+
 // ── Task 3: Responses API transformer ───────────────────────────────────────
 
 const BIG_INSTRUCTIONS = 'These are detailed instructions. '.repeat(600); // ~20k chars
-const BIG_FLAT_TOOL_DESC = 'Flat tool description with lots of context. '.repeat(200); // ~8k chars
-const RESPONSES_TOOL_PARAMS = { type: 'object', description: 'Param root.', properties: { x: { type: 'string', description: 'x param' } } };
-const RESPONSES_TOOL_DOC = `## Tool: do_thing\n${BIG_FLAT_TOOL_DESC}\n\`\`\`json\n${JSON.stringify(RESPONSES_TOOL_PARAMS)}\n\`\`\``;
+const BIG_FLAT_TOOL_DESC = 'Flat tool description with lots of context. '.repeat(200); // ~8k chars — kept native, never imaged
+const RESPONSES_TOOL_PARAMS = { type: 'object', description: `Param root. ${BIG_SCHEMA_ANNO}`, properties: { x: { type: 'string', description: `x param. ${BIG_SCHEMA_ANNO}` } } };
+// Imaged doc = heading + full (unstripped) schema — NO description (that rides natively).
+const RESPONSES_TOOL_DOC = `## Tool: do_thing\n\`\`\`json\n${JSON.stringify(RESPONSES_TOOL_PARAMS)}\n\`\`\``;
 
 describe('transformOpenAIResponses (gpt-5.6)', () => {
   it('compresses GPT Responses instructions + tool docs while preserving native tool selection metadata', async () => {
