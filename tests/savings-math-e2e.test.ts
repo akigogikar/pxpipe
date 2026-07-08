@@ -19,9 +19,14 @@
  *
  * Run just this file:  pnpm vitest run tests/savings-math-e2e.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createProxy, type ProxyEvent } from '../src/core/proxy.js';
 import { countTokens as o200k } from 'gpt-tokenizer/encoding/o200k_base';
+
+// Real-proxy e2e: image rendering can briefly exceed the 5s default under
+// full-suite parallel load. Bump so genuine renders never trip a spurious
+// timeout (isolated runtime is well under 1s).
+vi.setConfig({ testTimeout: 30_000 });
 
 const PROBE_TOKENS = 9999; // canned count_tokens result from the fake upstream
 

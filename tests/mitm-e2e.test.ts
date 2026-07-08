@@ -1,9 +1,14 @@
-import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import { describe, expect, it, beforeAll, afterAll, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+
+// Real end-to-end: spawns the built pxpipe + a real `claude` CLI subprocess
+// (internal cap 90s). Set the vitest timeout above that cap so the subprocess's
+// own timeout governs, not a premature 5s default kill under full-suite load.
+vi.setConfig({ testTimeout: 120_000 });
 
 // Real end-to-end: drive the standalone `claude` CLI through the built `pxpipe
 // mitm` proxy, exactly as Claude Desktop would be wired. GATED — needs the flag,

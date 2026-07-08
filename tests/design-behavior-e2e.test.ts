@@ -18,8 +18,13 @@
  *
  * Run just this file:  pnpm vitest run tests/design-behavior-e2e.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createProxy } from '../src/core/proxy.js';
+
+// Real-proxy e2e: image rendering can briefly exceed the 5s default under
+// full-suite parallel load. Bump so genuine renders never trip a spurious
+// timeout (isolated runtime is well under 1s).
+vi.setConfig({ testTimeout: 30_000 });
 
 function fakeUpstream() {
   const main: string[] = [];

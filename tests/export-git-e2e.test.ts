@@ -1,10 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+
+// Real end-to-end: spawns `pxpipe export --git` via spawnSync (internal cap
+// 120s). Set the vitest timeout above that cap so the command's own timeout
+// governs, not a premature 5s default kill under full-suite load.
+vi.setConfig({ testTimeout: 150_000 });
 
 // End-to-end coverage of the real `pxpipe export --git` path (the bug PR-4 fixed
 // was in collectSource's untracked branch, not in the readExportTextFile helper).
