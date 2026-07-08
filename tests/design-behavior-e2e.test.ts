@@ -108,6 +108,33 @@ describe('design: SYSTEM PROMPT imaging (Anthropic)', () => {
     // The live turn is preserved verbatim and legible.
     expect(hay).toContain('LIVE_QUESTION here');
   });
+
+  it('keeps non-cache-controlled appended system blocks as live text', async () => {
+    // Shape produced by Claude Code's `--append-system-prompt`: the cache
+    // breakpoints are spent on the CLAUDE.md slab; the user's per-invocation
+    // directive is tacked on the end as a text block with NO cache_control.
+    const out = await drive(
+      '/v1/messages',
+      JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 16,
+        system: [
+          { type: 'text', text: 'SLAB_SECRET_' + big(80_000), cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: 'APPENDED_SYSTEM_SENTINEL_keep_live_text' },
+        ],
+        messages: [{ role: 'user', content: 'LIVE_QUESTION here' }],
+      }),
+    );
+    const hay = JSON.stringify(out);
+    // The cache-controlled slab is still imaged (not billed as text).
+    expect(hay).not.toContain('SLAB_SECRET_');
+    expect(imageCount(out)).toBeGreaterThan(0);
+    // The appended directive stays LIVE in the system field — imaging it would
+    // make it OCR-only and bake a volatile string into the cached slab image.
+    expect(JSON.stringify(out.system ?? '')).toContain('APPENDED_SYSTEM_SENTINEL_keep_live_text');
+    // Live turn preserved.
+    expect(hay).toContain('LIVE_QUESTION here');
+  });
 });
 
 // ===========================================================================

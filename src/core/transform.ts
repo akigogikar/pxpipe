@@ -629,20 +629,55 @@ export interface TransformInfo {
 
 // --- helpers ---------------------------------------------------------------
 
-/** Extract (text, remainder) from a system field that may be string or block list. */
-function extractSystemText(sys: SystemField | undefined): { text: string; kept: SystemField } {
-  if (sys == null) return { text: '', kept: [] };
-  if (typeof sys === 'string') return { text: sys, kept: '' };
+/** Extract (text, remainder) from a system field that may be string or block list.
+ *
+ *  `appended`: trailing text blocks that sit AFTER the last cache-controlled text
+ *  block and carry no cache_control of their own. This is exactly the shape
+ *  `--append-system-prompt` produces — Claude Code spends its cache breakpoints on
+ *  tools + the CLAUDE.md slab, then tacks the user's per-invocation directive on
+ *  the end with no breakpoint. Imaging it (as `text` did for every block) made the
+ *  directive OCR-only and, worse, baked a per-invocation string into the cached
+ *  slab image (busting the image cache whenever the flag changed). We split it out
+ *  so it stays LIVE text in the native `system` field and never touches the image
+ *  (issue #66/#75). Only recognisable when a cache breakpoint exists to mark where
+ *  the static slab ends; without one we can't tell slab from append, so everything
+ *  stays `text` (the historical behaviour, and the small-string case anyway). */
+function extractSystemText(
+  sys: SystemField | undefined,
+): { text: string; kept: SystemField; appended: string } {
+  if (sys == null) return { text: '', kept: [], appended: '' };
+  if (typeof sys === 'string') return { text: sys, kept: '', appended: '' };
+  // Index of the last text block carrying a cache_control marker — the boundary
+  // between the cached static slab and any non-cacheable appended directive.
+  let lastCcIdx = -1;
+  for (let i = 0; i < sys.length; i++) {
+    const b = sys[i];
+    if (b && typeof b === 'object' && b.type === 'text' && b.cache_control !== undefined) {
+      lastCcIdx = i;
+    }
+  }
   const textParts: string[] = [];
+  const appendedParts: string[] = [];
   const kept: SystemField = [];
-  for (const block of sys) {
-    if (block && typeof block === 'object' && block.type === 'text') {
-      textParts.push(block.text);
+  for (let i = 0; i < sys.length; i++) {
+    const block = sys[i];
+    if (!block) continue;
+    if (typeof block === 'object' && block.type === 'text') {
+      // Post-breakpoint, no cache_control of its own → live appended directive.
+      if (lastCcIdx >= 0 && i > lastCcIdx && block.cache_control === undefined) {
+        appendedParts.push(block.text);
+      } else {
+        textParts.push(block.text);
+      }
     } else {
       kept.push(block);
     }
   }
-  return { text: textParts.join('\n\n'), kept };
+  return {
+    text: textParts.join('\n\n'),
+    kept,
+    appended: appendedParts.join('\n\n'),
+  };
 }
 
 function lastStaticSystemCacheControl(sys: SystemField | undefined): TextBlock['cache_control'] | undefined {
@@ -1499,7 +1534,8 @@ export async function transformRequest(
   //    - dynamicText: <env>/<context>/... blocks (per-turn, kept as text).
   //    - staticText: everything else (cacheable, goes into the image).
   const systemStaticCacheControl = lastStaticSystemCacheControl(req.system);
-  const { text: rawSysText, kept: sysRemainder } = extractSystemText(req.system);
+  const { text: rawSysText, kept: sysRemainder, appended: appendedSysText } =
+    extractSystemText(req.system);
   const { kept: billingLine, body: sysBodyWithEnv } = stripBillingLine(rawSysText);
   // Pull the volatile `# Environment` markdown section out BEFORE the
   // static/dynamic split so per-session git state never reaches the slab image.
@@ -1780,6 +1816,11 @@ export async function transformRequest(
       if (envMarkdown) sysTail.push({ type: 'text', text: envMarkdown });
     }
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
+    // `--append-system-prompt` content (post-breakpoint, non-cacheable) stays LIVE
+    // system text — it's the user's per-invocation directive, and imaging it would
+    // make it OCR-only *and* bake a volatile string into the cached slab image
+    // (issue #66/#75). Carried verbatim after the slab, as its original position.
+    if (appendedSysText) sysTail.push({ type: 'text', text: appendedSysText });
     // Tool Reference now rides INSIDE the imaged slab (combinedRaw above) — no
     // text splice here. Stubbed tools[] descriptions cite the "## Tool: <name>"
     // headings inside the image; stub ↔ reference invariant holds because both
