@@ -500,33 +500,41 @@ describe('runExportCore integration', () => {
 // ---------------------------------------------------------------------------
 
 describe('exportImageTokens model routing', () => {
-  // Dense export page: width = 2*4 + 384*5 = 1928 px, height = MAX_HEIGHT_PX = 1932 px
+  // A large page (1928×1932 px) used purely to exercise both cost formulas. Both
+  // dims are multiples of the 28-px patch grid → ceil(1928/28)=69, ceil(1932/28)=69.
   const W = 1928;
   const H = 1932;
+  // Anthropic 28-px patch grid: ceil(ceil(W/28)·ceil(H/28)·1.10) = ceil(69·69·1.10) = 5238.
+  const claudeExpected = Math.ceil(Math.ceil(W / 28) * Math.ceil(H / 28) * 1.1);
 
-  it('returns Anthropic-formula tokens for claude-sonnet-4-5', () => {
-    // Anthropic formula: ceil(W*H/750 * 1.10)
-    const expected = Math.ceil((W * H / 750) * 1.10);
-    expect(exportImageTokens('claude-sonnet-4-5', W, H)).toBe(expected);
+  it('matches Anthropic per-image caps at the tier reference sizes', () => {
+    // Raw 28-px patch count (no safety margin) at the published reference dims.
+    const patches = (w: number, h: number) => Math.ceil(w / 28) * Math.ceil(h / 28);
+    expect(patches(1568, 784)).toBe(1568); // standard-tier reference (56·28)
+    expect(patches(2576, 1456)).toBe(4784); // high-res per-image cap (92·52)
+    expect(patches(1928, 1932)).toBe(4761); // RENDER_SIZING's 1928² page (69·69)
+    expect(patches(1568, 728)).toBe(1456); // pxpipe's actual 1568×728 page (56·26)
   });
 
-  it('returns Anthropic-formula tokens for any claude-* model', () => {
-    const expected = Math.ceil((W * H / 750) * 1.10);
-    expect(exportImageTokens('claude-opus-4', W, H)).toBe(expected);
-    expect(exportImageTokens('claude-haiku-3-5', W, H)).toBe(expected);
+  it('returns Anthropic patch-grid tokens for claude-sonnet-4-5', () => {
+    expect(exportImageTokens('claude-sonnet-4-5', W, H)).toBe(claudeExpected);
   });
 
-  it('returns Anthropic-formula tokens when model includes "anthropic"', () => {
-    const expected = Math.ceil((W * H / 750) * 1.10);
-    expect(exportImageTokens('anthropic/claude-3-5-sonnet', W, H)).toBe(expected);
+  it('returns Anthropic patch-grid tokens for any claude-* model', () => {
+    expect(exportImageTokens('claude-opus-4', W, H)).toBe(claudeExpected);
+    expect(exportImageTokens('claude-haiku-3-5', W, H)).toBe(claudeExpected);
+  });
+
+  it('returns Anthropic patch-grid tokens when model includes "anthropic"', () => {
+    expect(exportImageTokens('anthropic/claude-3-5-sonnet', W, H)).toBe(claudeExpected);
   });
 
   it('returns GPT (OpenAI tile) tokens for gpt-4o', () => {
-    // OpenAI tile formula is much cheaper for this image size (~765 vs ~5464)
+    // OpenAI tile formula is much cheaper for this image size (~765 vs ~5238)
     const gpTokens = exportImageTokens('gpt-4o', W, H);
     const claudeTokens = exportImageTokens('claude-sonnet-4-5', W, H);
     // GPT-4o tile formula for 1928x1932 px: scaled to 768x769, 2x2 tiles
-    // = 85 + 170*4 = 765 tokens — far less than Anthropic's ~5464
+    // = 85 + 170*4 = 765 tokens — far less than Anthropic's ~5238
     expect(gpTokens).toBeLessThan(claudeTokens);
     expect(gpTokens).toBeGreaterThan(0);
   });

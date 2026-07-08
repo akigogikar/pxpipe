@@ -134,8 +134,10 @@ const DEFAULTS: Required<TransformOptions> = {
   minToolResultChars: 6000,
   // system field rejects images (400 system.N.type: Input should be 'text') —
   // images always go into the first user message.
-  // 313 cols × 5 px + 8 px pad = 1573 px slab width (under 2000 px ceiling).
-  cols: 313,
+  // 312 cols × 5 px + 8 px pad = 1568 px slab width — exactly the API's long-edge
+  // bound (313 cols = 1573 px triggers a 0.997× resample, blurring every glyph;
+  // see DEFAULT_COLS in render.ts).
+  cols: 312,
   maxImagesPerToolResult: 10,
   charsPerToken: 4,
   historyAmortizationHorizon: 1,
@@ -153,10 +155,10 @@ const DEFAULTS: Required<TransformOptions> = {
 
 // --- per-block break-even check ---
 //
-// Image token cost is computed from pixel area (Anthropic formula: w×h/750,
-// empirically accurate to ~5% on dense PNGs). Constants bias CONSERVATIVE:
-// CHARS_PER_TOKEN=4 under-estimates text savings; multi-col cost is linearly
-// scaled from single-col + 10% margin. Mispredictions leave money on the
+// Image token cost is computed from the Anthropic 28-px patch grid
+// (tokens = ceil(w/28)·ceil(h/28); see ANTHROPIC_IMAGE_PATCH_PX). Constants bias
+// CONSERVATIVE: CHARS_PER_TOKEN=4 under-estimates text savings; multi-col cost is
+// linearly scaled from single-col + 10% margin. Mispredictions leave money on the
 // table; they never generate net-loss images.
 
 /** English ~4 chars per token average (conservative for code/JSON content). */
@@ -180,12 +182,17 @@ export const HISTORY_CHARS_PER_TOKEN = 2.0;
  *  of truth — src/core/export.ts imports this rather than redefining it. */
 export const REPORT_CHARS_PER_TOKEN = 3.7;
 
-/** Anthropic image-billing formula: `tokens ≈ width × height / 750`.
+/** Anthropic vision patch size (px). Claude 4+ vision (Opus 4.8 / Fable 5) bills an
+ *  image as a grid of 28×28-px patches: `tokens = ceil(W/28) · ceil(H/28)`, replacing
+ *  the retired `w×h/750` pixel-area estimate. This matches the published per-image caps:
+ *    · standard tier — long edge ≤ 1568 px (a 1568×784 page = 56·28 = 1568 tok);
+ *    · high-res tier (Opus 4.8 / Fable 5) — long edge ≤ 2576 px, ≤ 4784 tok/image
+ *      (a 2576×1456 page = 92·52 = 4784 tok, the hard cap; larger is *rejected*, not
+ *      downscaled). pxpipe's >20-image requests are additionally held to ≤2000 px/side.
+ *  Our 1568×728 page bills 56·26 = 1456 tok — patch-aligned and well under the cap.
  *  https://docs.anthropic.com/en/docs/build-with-claude/vision#image-tokens
- *  Accurate to ~5% on dense glyph PNGs (N=14 empirical calibration). The renderer
- *  sizes height to content, so per-block images cost far less than full-canvas.
- *  Exported so the export pipeline can reuse the same constant rather than hardcoding. */
-export const ANTHROPIC_PIXELS_PER_TOKEN = 750;
+ *  Exported so the export pipeline reuses the same constant rather than hardcoding. */
+export const ANTHROPIC_IMAGE_PATCH_PX = 28;
 /** Conservative 10% upward bias on Anthropic image token estimates — keeps the gate
  *  on the safe (pass-through) side when the true cost is near the break-even point.
  *  Exported so the export pipeline reuses the same value. */
@@ -232,8 +239,13 @@ function imageTokensForRows(
   const rowsInLast = Math.min(Math.max(1, linesInLast), rowsPerImage);
   const fullImageHeight = 2 * PAD_Y + rowsPerImage * CELL_H;
   const lastImageHeight = 2 * PAD_Y + rowsInLast * CELL_H;
-  const totalPixels = fullImages * widthPx * fullImageHeight + widthPx * lastImageHeight;
-  return Math.ceil((totalPixels / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
+  // 28-px patch billing: tokens = ceil(W/28)·ceil(H/28) per image. ceil() is
+  // per-image, so multi-page cost is summed image-by-image (not from pooled area).
+  const patchesWide = Math.ceil(widthPx / ANTHROPIC_IMAGE_PATCH_PX);
+  const patchesPerFull = patchesWide * Math.ceil(fullImageHeight / ANTHROPIC_IMAGE_PATCH_PX);
+  const patchesLast = patchesWide * Math.ceil(lastImageHeight / ANTHROPIC_IMAGE_PATCH_PX);
+  const totalPatches = fullImages * patchesPerFull + patchesLast;
+  return Math.ceil(totalPatches * IMAGE_COST_SAFETY_MARGIN);
 }
 
 /** Exact image-token cost for `text`. Uses `countVisualRows` and optionally

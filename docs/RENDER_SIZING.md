@@ -11,29 +11,30 @@ A rendered page is a **fixed-width, variable-height** image. It is **not
 deliberately squared** and **never shrunk horizontally to fit short lines**.
 
 - **Width is constant per path**, set by the column count, not by content:
-  `width = 2·PAD_X + cols·CELL_W`. The static slab renders at `DEFAULT_COLS=313`
-  → `8 + 313·5 = 1573px`; dense tool/history pages render at
-  `DENSE_CONTENT_COLS=384` → `8 + 384·5 = 1928px`.
+  `width = 2·PAD_X + cols·CELL_W`. Both the static slab (`DEFAULT_COLS=312`) and
+  dense tool/history pages (`DENSE_CONTENT_COLS=312`) render at
+  `8 + 312·5 = 1568px` — exactly the API's standard long-edge bound.
 - **Height grows to fit the lines on the page**, capped, then pages:
   `height = 2·PAD_Y + nLines·CELL_H` → `8 + 8·nLines`.
 - **Vertical cap → paging**: `maxLines = floor((MAX_HEIGHT_PX − 2·PAD_Y) / CELL_H)`
-  `= floor(1924/8) = 240` lines. Overflow goes to the next image, it does not
-  grow the canvas. A *full dense* page is `1928 × 1928` (≈square only because
-  384 cols ≈ 240 rows at the 5×8 cell — not deliberately squared); a *full slab*
-  page is `1573 × 1280` (~159 rows, READABLE-bound below the 240 cap); a
-  *partial* page (small tool_result, last page) is wide-and-short, e.g. `1928 × 160`.
+  `= floor(720/8) = 90` lines. Overflow goes to the next image, it does not grow
+  the canvas. A *full* page is `1568 × 728` (90 rows ≈ 28,080 chars); a *partial*
+  page (small tool_result, last page) is wide-and-short, e.g. `1568 × 160`. Pages
+  are always **wide-and-short, never squared**.
 
-This `~1932×1932` ceiling is the largest page Fable / Opus 4.8 accept without a
-server-side resize. Those models take up to **2576 px** on the long edge, but a
-request with **>20 images** (pxpipe always sends many) is held to the stricter
-**≤2000 px/side** rule, and `1928×1928` = `69×69` = **4761 visual tokens**, just
-under the **4784**-token per-image cap. Going bigger gets the request *rejected*,
-not downscaled.
+The `1568×728` page (`= 1,141,504 px`) fits **both** the standard long-edge bound
+(≤1568 px) and the ~1.15 MP area bound, so the vision encoder sees it WYSIWYG (no
+server-side resample that would blur the 5×8 glyphs). Fable / Opus 4.8 would accept
+up to **2576 px** on the long edge (**≤4784 tok/image**), but a request with **>20
+images** (pxpipe always sends many) is held to the stricter **≤2000 px/side** rule;
+staying at 1568 px keeps every request in-bounds. Going over gets the request
+*rejected*, not downscaled. The page bills as `ceil(1568/28)·ceil(728/28)` =
+`56·26` = **1456 visual tokens**, far under the 4784 cap.
 
 Source of truth: `renderChunkToPng` in `src/core/render.ts` (the `width` /
 `height` lines), constants `PAD_X=PAD_Y=4`, `CELL_W=5`, `CELL_H=8` (the "5×8
-cell"), `DEFAULT_COLS=313`, `DENSE_CONTENT_COLS=384`, `MAX_HEIGHT_PX=1932`,
-`READABLE_CHARS_PER_IMAGE=50000`, `DENSE_CONTENT_CHARS_PER_IMAGE=92160`.
+cell"), `DEFAULT_COLS=312`, `DENSE_CONTENT_COLS=312`, `MAX_HEIGHT_PX=728`,
+`READABLE_CHARS_PER_IMAGE=28080`, `DENSE_CONTENT_CHARS_PER_IMAGE=28080`.
 
 ## The cell
 
@@ -66,50 +67,48 @@ The reasoning:
 
 ## Why not "square with max width"
 
-Anthropic bills images by **pixel area** (≈ `w·h/750`), not by the longest edge.
-So a square is not cheaper than a wide-short image of the same area — what
-minimizes cost is the *tightest bounding box around the text*, and for dense
-reflowed content that box is exactly "full width × just enough rows," which is
-what we render. We never *pad* to a square: a full dense page lands at
-`1928×1928` only because 384 cols and 240 rows are equal pixel extents at the
-5×8 cell — it's the max-chars-per-page point (the ~1932² token ceiling), not an
-aspect-ratio target, and a partial page stays wide-and-short. Aspect ratio is a
-non-goal; **chars-per-pixel** is the goal, achieved by filling every row to
-`cols` and paging vertically.
+Anthropic bills images by a **28×28-px patch grid** (`tokens = ceil(w/28)·ceil(h/28)`),
+i.e. by area, not by the longest edge. So a square is not cheaper than a
+wide-short image of the same area — what minimizes cost is the *tightest bounding
+box around the text*, and for dense reflowed content that box is exactly "full
+width × just enough rows," which is what we render. We never *pad* to a square: a
+full page lands at `1568×728` (90 rows), wide-and-short, and a partial page is
+shorter still. Aspect ratio is a non-goal; **chars-per-pixel** is the goal,
+achieved by filling every row to `cols` and paging vertically.
 
 ## Two render paths
 
-- **tool_result / history images**: single-column at `DENSE_CONTENT_COLS=384`
-  (1928px wide), paged at the 240-line cap → full pages are `1928×1928`
-  (~92k chars each).
-- **system-slab image**: single-column at `DEFAULT_COLS=313` (1573px wide),
-  READABLE-bound to ~159 rows (~50k chars → `1573×1280`). Kept on a path that
+- **tool_result / history images**: single-column at `DENSE_CONTENT_COLS=312`
+  (1568px wide), paged at the 90-line cap → full pages are `1568×728`
+  (~28k chars each).
+- **system-slab image**: single-column at `DEFAULT_COLS=312` (1568px wide),
+  also 90-line / 728px-bound (~28k chars → `1568×728`). Kept on a path that
   *can* use multi-column packing (`shrinkWidth=false`), but multi-col is
-  **disabled by default** (`multiCol: 1`) because at 313 cols a single column
-  already holds ~50k chars/page and multi-col adds OCR column-ordering risk
+  **disabled by default** (`multiCol: 1`) because at 312 cols a single column
+  already holds ~28k chars/page and multi-col adds OCR column-ordering risk
   without meaningful savings.
 
 So in practice everything is single-column full-width today; the multi-col code
 is retained for backward compat.
 
-## Billing model (and an unresolved gap)
+## Billing model
 
-- **Anthropic's documented formula**: `tokens ≈ (w·h) / 750`.
-- **The gate's constant**: `src/core/transform.ts` anchors per-image cost on an
-  *empirical* figure (~2500 tok for a 508×1559 canvas, i.e. claiming the doc
-  formula underpredicts billing by ~2.4×). That measurement is from an earlier
-  cell/column regime.
-- **A fresh regression** on production `~/.pxpipe/events.jsonl` (2-var OLS,
-  `tokens ≈ a·text_chars + b·image_pixels`, N≈1.5k cold-miss events) gives
-  **~907 pixels/token** and **~1.8 chars/token** for text — i.e. *much* closer
-  to the doc's 750 than to the gate's stale ~312 px/tok.
-
-These disagree by ~3×. The gate is therefore likely **pessimistic** about image
-cost on current traffic (it may pass up profitable compressions). Re-grounding
-`TOKENS_PER_IMAGE` from a fresh regression is an open task — the data is in the
-event log (`image_pixels` next to `input_tokens + cache_create_tokens` on
-cold-miss rows). Don't trust any single hardcoded image-cost constant without
-re-checking it against the log.
+- **Anthropic's formula**: an image is billed as a grid of **28×28-px patches**,
+  `tokens = ceil(w/28)·ceil(h/28)`. The retired `w·h/750` pixel-area estimate was
+  an approximation of the same thing (√750 ≈ 27.4 px/patch); the exact patch count
+  is what the gate and the `pxpipe export` report now use — `ANTHROPIC_IMAGE_PATCH_PX
+  = 28` in `src/core/transform.ts`, reused by `src/core/export.ts`, with a
+  conservative `IMAGE_COST_SAFETY_MARGIN = 1.10`.
+- **Per-image caps** (why the geometry is what it is):
+  - *standard tier* — long edge ≤ 1568 px; a 1568×784 page = `56·28` = **1568 tok**.
+  - *high-res tier* (Fable 5 / Opus 4.8) — long edge ≤ 2576 px, **≤ 4784 tok/image**
+    (a 2576×1456 page = `92·52` = 4784 tok is the hard cap; larger is *rejected*,
+    not downscaled). Requests with >20 images are additionally held to ≤2000 px/side.
+- **Our page** (1568×728) bills `56·26` = **1456 tok** — patch-aligned (both dims
+  are multiples of 28, so `ceil()` adds no overhead), well under the cap, and close
+  to the ~733 px/tok slope measured on real traffic (`~/.pxpipe/events.jsonl`),
+  confirming the patch grid tracks production billing. The gate and export report
+  are the single source of truth; don't hardcode a per-image token count elsewhere.
 
 ## How sizing decisions are/were measured
 
@@ -141,7 +140,9 @@ The sizing converged through measured iteration, not a single design. Key commit
 | 2026-05-25 | `bb8e0d8` | **page** dense tool/history images | enforce the 195-line cap, split overflow |
 | 2026-05-26 | `28bc65c` | reduce dense page size | tuning |
 | 2026-06-09 | `cdfc99d` | drop Opus, **Fable-5 only**; dense render on bare 5×8 cell | Opus misread ~7% of renders |
-| 2026-06-17 | (this change) | raise page ceiling to **~1932×1932**: `MAX_HEIGHT_PX=1932`, dense pages `DENSE_CONTENT_COLS=384` / `92160` chars; row cap follows each call's char budget | Fable/Opus 4.8 accept ≤2000px & ≤4784 tok/image (not the old 1568 limit); baseline left ~3× headroom unused → bigger pages = fewer image blocks at the same 5×8 legibility |
+| 2026-06-17 | `28bc65c…` | raise page ceiling to **~1932×1932**: `MAX_HEIGHT_PX=1932`, dense pages `DENSE_CONTENT_COLS=384` / `92160` chars; row cap follows each call's char budget | Fable/Opus 4.8 accept ≤2000px & ≤4784 tok/image (not the old 1568 limit); baseline left ~3× headroom unused → bigger pages = fewer image blocks at the same 5×8 legibility |
+| 2026-07-01 | (LEGIBILITY-AUDIT) | clamp page back to **1568×728**: `MAX_HEIGHT_PX=728`, `DEFAULT_COLS=DENSE_CONTENT_COLS=312`, `READABLE/DENSE_CONTENT_CHARS_PER_IMAGE=28080` | 1932² was billed at cap but resampled ~0.55× → 5×8 glyphs reached the encoder at ~2.8×4.4 px; 1568×728 = 1.14 MP fits both the ≤1568 px edge and ~1.15 MP bounds → WYSIWYG, no resample |
+| 2026-07-03 | (this change) | replace `w·h/750` pixel-area cost with the exact **28-px patch grid** (`ANTHROPIC_IMAGE_PATCH_PX=28`) in the gate (`transform.ts`) and `pxpipe export` report (`export.ts`); sync README / TRANSFORM_INFO / this doc | matches how Claude 4+ actually bills (`ceil(w/28)·ceil(h/28)`); the published per-image caps (1568 tok standard, 4784 tok high-res) now derive directly from the model instead of a stale ~2.4× fudge factor |
 
 The arc: **reflow** to stop wasting rows → **eval harness** to prove the packing
 is still readable → **width-shrink** experiment → **reverted** to full-canvas

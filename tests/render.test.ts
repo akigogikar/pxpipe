@@ -748,8 +748,10 @@ describe('transform', () => {
     // History: a bare `{type:'object'}` stub caused validator 400s; a text
     // reference paid the annotations at text rates. Current contract: tools[]
     // keeps the structural contract (type/properties/required/enum) for the
-    // validator, annotations (description/default/$schema) move into the
-    // imaged reference where they cost image rates.
+    // validator, annotations (description/default) move into the imaged
+    // reference where they cost image rates. `$schema` is the dialect
+    // declaration (not an annotation) and stays in tools[]: stripping it
+    // re-dialects draft-07 schemas to the validator's 2020-12 default and 400s.
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -823,8 +825,10 @@ describe('transform', () => {
     expect(s0.properties.mode.enum).toEqual(['read', 'binary']);
     // Annotations are stripped from tools[] everywhere in the tree.
     expect(JSON.stringify(s0)).not.toContain('description');
-    expect(s0.$schema).toBeUndefined();
     expect(s0.properties.mode.default).toBeUndefined();
+    // ...but the `$schema` dialect declaration survives (see schema-strip.ts):
+    // dropping it would re-dialect the schema and 400 the validator.
+    expect(s0.$schema).toBe('http://json-schema.org/draft-07/schema#');
     const s1 = out.tools[1].input_schema;
     expect(s1.required).toEqual(['command']);
     expect(Object.keys(s1.properties.env.properties)).toEqual(['PATH']);
