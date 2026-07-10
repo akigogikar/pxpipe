@@ -179,12 +179,21 @@ export async function aggregateSessions(
     // Events missing either probe stay out of the rollup — no estimation.
     const inp = ev.input_tokens ?? 0;
     const cc = ev.cache_create_tokens ?? 0;
+    const cc1h = ev.cache_create_1h_tokens ?? 0;
     const cr = ev.cache_read_tokens ?? 0;
     const haveUsage = inp > 0 || cc > 0 || cr > 0;
     const baseline = ev.baseline_tokens;
+    // Same gating rule as the dashboard: require an explicit 'ok' probe status
+    // when present; fall back to "have a baseline number" for legacy JSONL.
+    // Probe-MISS rows ('partial'/'failed') are excluded here — cacheable=0 in
+    // computeBaselineInputEff means "no markers", not "split unknown", and
+    // pricing an unsplittable warm row all-cold would fabricate savings.
+    const probeOk = ev.baseline_probe_status === 'ok'
+      || (ev.baseline_probe_status === undefined && typeof baseline === 'number' && baseline > 0);
     if (
       typeof baseline === 'number' &&
       baseline > 0 &&
+      probeOk &&
       haveUsage
     ) {
       const cacheable = ev.baseline_cacheable_tokens ?? 0;
@@ -210,8 +219,9 @@ export async function aggregateSessions(
         cr,
         warm,
         prevCacheable,
+        cc1h,
       );
-      const actualEff = computeActualInputEff(inp, cc, cr);
+      const actualEff = computeActualInputEff(inp, cc, cr, cc1h);
       const tokensSaved = baselineEff - actualEff;
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);

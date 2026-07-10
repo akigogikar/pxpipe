@@ -19,7 +19,7 @@
  * Run just this file:  pnpm vitest run tests/savings-honesty.test.ts
  */
 import { describe, expect, it } from 'vitest';
-import { computeBaselineInputEff, computeActualInputEff, CACHE_CREATE_RATE, CACHE_READ_RATE } from '../src/core/baseline.js';
+import { computeBaselineInputEff, computeActualInputEff, CACHE_CREATE_RATE, CACHE_CREATE_1H_RATE, CACHE_READ_RATE } from '../src/core/baseline.js';
 import {
   computeOpenAIBaselineInputEff,
   computeOpenAIActualInputEff,
@@ -111,14 +111,23 @@ describe('Anthropic savings honesty (cache-create / cache-read aware)', () => {
           for (const cc of ccs) for (const cr of crs) for (const prev of prevs) f(baseline, cacheable, input, cc, cr, prev);
   };
 
-  it('credits ZERO when the cacheable-prefix probe is missing (can not measure → claim nothing)', () => {
+  it('no cache_control markers: baseline priced COLD-UNCACHED (1.0× full body), never collapsed to actual', () => {
+    // Rows whose request legitimately carried no cache_control still have a real
+    // text counterfactual: the whole baseline at the cold input rate. The old
+    // early-return substituted actual_eff here, zeroing legitimate savings.
+    // (Probe-MISS rows are excluded upstream by the baselineProbeStatus gate —
+    // they never reach this function with a credited baseline.)
     sweep((baseline, cacheable, input, cc, cr, prev) => {
       if (cacheable > 0) return;
-      const actual = computeActualInputEff(input, cc, cr);
-      // baseline<=0 returns 0 (no baseline); baselineCacheable<=0 returns actual (no credit).
-      const eff = computeBaselineInputEff(baseline, cacheable, input, cc, cr, false, prev);
-      if (baseline <= 0) expect(eff).toBe(0);
-      else expect(eff - actual).toBe(0); // saved 0
+      const cold = computeBaselineInputEff(baseline, cacheable, input, cc, cr, false, prev);
+      const warm = computeBaselineInputEff(baseline, cacheable, input, cc, cr, true, prev);
+      if (baseline <= 0) {
+        expect(cold).toBe(0);
+        expect(warm).toBe(0);
+      } else {
+        expect(cold).toBe(baseline); // cacheable=0 ⇒ whole body is cold tail × 1.0
+        expect(warm).toBe(baseline); // nothing to reuse/grow either
+      }
     });
   });
 
@@ -138,6 +147,52 @@ describe('Anthropic savings honesty (cache-create / cache-read aware)', () => {
       expect(cold).toBeGreaterThanOrEqual(0);
       expect(cold).toBeLessThanOrEqual(baseline * 1.25 + 1e-9); // can't fabricate a bigger counterfactual
     });
+  });
+});
+
+// ===========================================================================
+// 1h cache-create tier: Anthropic bills ttl:'1h' creates at 2×, not 1.25×.
+// Pricing them at 1.25× undercharges actual_eff by 0.75×cc1h and inflates
+// reported savings by exactly that amount.
+describe('1h cache-create tier honesty (2× not 1.25×)', () => {
+  it('rate constant matches Anthropic 1h pricing', () => {
+    expect(CACHE_CREATE_1H_RATE).toBe(2.0);
+  });
+
+  it('synthetic 1h-TTL row: actual_eff rises by (2.0−1.25)×cc1h', () => {
+    const cc = 20_000;
+    const cc1h = 8_000;
+    const without = computeActualInputEff(1_000, cc, 5_000);
+    const with1h = computeActualInputEff(1_000, cc, 5_000, cc1h);
+    expect(with1h - without).toBeCloseTo((CACHE_CREATE_1H_RATE - CACHE_CREATE_RATE) * cc1h, 6);
+  });
+
+  it('cc1h is clamped to [0, cc] — malformed usage cannot corrupt the row', () => {
+    expect(computeActualInputEff(0, 100, 0, 500)).toBe(100 * CACHE_CREATE_1H_RATE);
+    expect(computeActualInputEff(0, 100, 0, -5)).toBe(100 * CACHE_CREATE_RATE);
+    expect(computeActualInputEff(0, 0, 0, 500)).toBe(0);
+  });
+
+  it('text counterfactual creates at the observed 5m/1h blend (client TTL policy carries over)', () => {
+    // cold, baseline 30k with 20k cacheable + 10k tail
+    const all5m = computeBaselineInputEff(30_000, 20_000, 0, 10_000, 0, false, 0, 0);
+    const all1h = computeBaselineInputEff(30_000, 20_000, 0, 10_000, 0, false, 0, 10_000);
+    const half = computeBaselineInputEff(30_000, 20_000, 0, 10_000, 0, false, 0, 5_000);
+    expect(all5m).toBe(20_000 * CACHE_CREATE_RATE + 10_000);
+    expect(all1h).toBe(20_000 * CACHE_CREATE_1H_RATE + 10_000);
+    expect(half).toBe(20_000 * ((CACHE_CREATE_RATE + CACHE_CREATE_1H_RATE) / 2) + 10_000);
+  });
+
+  it('1h rows do not fabricate savings: saving delta vs 5m-only is bounded by the blend on cacheable', () => {
+    // Same event priced as 1h must not report MORE saved than as 5m when the
+    // actual path created the same tokens the counterfactual creates.
+    const cc = 20_000;
+    const cc1h = cc;
+    const actual5m = computeActualInputEff(1_000, cc, 0);
+    const actual1h = computeActualInputEff(1_000, cc, 0, cc1h);
+    const base5m = computeBaselineInputEff(30_000, 20_000, 1_000, cc, 0, false, 0);
+    const base1h = computeBaselineInputEff(30_000, 20_000, 1_000, cc, 0, false, 0, cc1h);
+    expect(base1h - actual1h).toBeCloseTo(base5m - actual5m, 6);
   });
 });
 

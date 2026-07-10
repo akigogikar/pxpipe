@@ -4,9 +4,28 @@
  * See docs/CACHING_AND_SAVINGS.md for the full derivation and audit history.
  */
 
-/** Documented Anthropic price ratios: cc_5m = 1.25×, cr = 0.1× base input. One-line change if rates change. */
+/** Documented Anthropic price ratios: cc_5m = 1.25×, cc_1h = 2×, cr = 0.1× base input. One-line change if rates change. */
 export const CACHE_CREATE_RATE = 1.25;
+export const CACHE_CREATE_1H_RATE = 2.0;
 export const CACHE_READ_RATE = 0.1;
+
+/** Clamp the 1h-tier share of cache-create tokens to [0, cc]. */
+function clampCc1h(cc: number, cc1h: number): number {
+  return Math.min(Math.max(cc1h, 0), Math.max(cc, 0));
+}
+
+/**
+ * Effective create rate for this turn's observed 5m/1h mix. The text
+ * counterfactual inherits the client's own TTL policy: if the real request
+ * carried ttl:'1h' markers, the imagined text path would have paid the 2×
+ * create on the same share of its prefix. Falls back to the 5m rate when the
+ * split is unknown (cc1h absent) or nothing was created.
+ */
+function blendedCreateRate(cc: number, cc1h: number): number {
+  const c1h = clampCc1h(cc, cc1h);
+  if (!(cc > 0) || c1h <= 0) return CACHE_CREATE_RATE;
+  return ((cc - c1h) * CACHE_CREATE_RATE + c1h * CACHE_CREATE_1H_RATE) / cc;
+}
 
 /** Anthropic prompt-cache TTL (seconds). Kept for callers that display provider
  *  docs, but savings math does not use TTL to infer a hypothetical text-cache
@@ -91,9 +110,13 @@ export function deriveBaselineWarmth(
  *
  * Saving = baseline_eff − actual_eff; can be negative (honestly reported, not floored).
  *
- * @param baselineCacheable  tokens up to the last cache_control marker. ≤0 ⇒ credit nothing.
+ * @param baselineCacheable  tokens up to the last cache_control marker. ≤0 ⇒ no
+ *                           prefix to discount: the whole baseline is priced by
+ *                           the cold-path formula (cacheable=0 ⇒ exactly `baseline`).
  * @param warm               was a warm cache available for this session this turn?
  * @param prevCacheable      cacheable prefix size on this session's previous turn (warm only).
+ * @param cc1h               1h-tier share of cc (cache_create_1h_tokens); prices the
+ *                           text counterfactual's create at the observed 5m/1h blend.
  */
 export function computeBaselineInputEff(
   baseline: number,
@@ -103,30 +126,45 @@ export function computeBaselineInputEff(
   cr: number,
   warm = false,
   prevCacheable = 0,
+  cc1h = 0,
 ): number {
   if (baseline <= 0) return 0;
-  // Probe miss: can't split prefix from tail, so credit nothing (same as actual).
-  if (baselineCacheable <= 0) return computeActualInputEff(inputTokens, cc, cr);
-  const cacheable = Math.min(baselineCacheable, baseline);
+  // Probe miss / no cache_control markers: no prefix to discount. Falls through
+  // to the cold formula, which at cacheable=0 prices the full baseline at 1.0×.
+  // (Previously this early-returned actual_eff, zeroing legitimate savings on
+  // rows that simply carried no cache_control.)
+  const cacheable = Math.min(Math.max(baselineCacheable, 0), baseline);
   const coldTail = baseline - cacheable;
+  const createRate = blendedCreateRate(cc, cc1h);
   if (warm) {
     // Text reads the prefix it already had cached (0.10×) and creates only the
-    // growth since last turn (1.25×). Independent of the image path's cache.
+    // growth since last turn (blended 1.25×/2× rate). Independent of the image
+    // path's cache.
     const reused = Math.min(Math.max(prevCacheable, 0), cacheable);
     const grown = cacheable - reused;
-    return reused * CACHE_READ_RATE + grown * CACHE_CREATE_RATE + coldTail * 1.0;
+    return reused * CACHE_READ_RATE + grown * createRate + coldTail * 1.0;
   }
   // Cold (first turn / TTL expiry): no warm cache for text either, so it
   // re-creates the whole cacheable prefix at the create rate — same event the
   // imaged path pays. Removes the phantom "free read" that fabricated a loss.
-  return cacheable * CACHE_CREATE_RATE + coldTail * 1.0;
+  return cacheable * createRate + coldTail * 1.0;
 }
 
-/** Weighted input cost pxpipe actually paid this turn. */
+/**
+ * Weighted input cost pxpipe actually paid this turn.
+ * @param cc1h  1h-tier share of cc (cache_create_1h_tokens), billed at 2× not
+ *              1.25×. Omitting it undercharges actual_eff by 0.75×cc1h and
+ *              inflates reported savings by the same amount.
+ */
 export function computeActualInputEff(
   inputTokens: number,
   cc: number,
   cr: number,
+  cc1h = 0,
 ): number {
-  return inputTokens + cc * CACHE_CREATE_RATE + cr * CACHE_READ_RATE;
+  const c1h = clampCc1h(cc, cc1h);
+  return inputTokens
+    + (cc - c1h) * CACHE_CREATE_RATE
+    + c1h * CACHE_CREATE_1H_RATE
+    + cr * CACHE_READ_RATE;
 }

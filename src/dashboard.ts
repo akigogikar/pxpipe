@@ -566,6 +566,9 @@ export class DashboardState {
     const inp = u?.input_tokens ?? 0;
     const out = u?.output_tokens ?? 0;
     const cc = u?.cache_creation_input_tokens ?? 0;
+    // 1h-tier create share (billed 2× not 1.25×); absent on 5m-only responses.
+    const cc1h = (u as { cache_creation?: { ephemeral_1h_input_tokens?: number } } | undefined)
+      ?.cache_creation?.ephemeral_1h_input_tokens ?? 0;
     const cr = u?.cache_read_input_tokens ?? 0;
     const gpt = isOpenAIEvent(ev.path);
 
@@ -629,7 +632,7 @@ export class DashboardState {
       haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
 
       // Weighted INPUT cost we actually paid this turn.
-      actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+      actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr, cc1h) : 0;
 
       // pxpipe only reduces input by imaging the static slab. An UNCOMPRESSED
       // row had its body forwarded untouched, so its unproxied counterfactual
@@ -676,6 +679,7 @@ export class DashboardState {
             cr,
             warm,
             prevCacheable,
+            cc1h,
           )
         : actualInputEff;
       // Record this completed turn's prefix size for future cr>0 split estimates.
@@ -905,6 +909,7 @@ export class DashboardState {
       const inp = t.input_tokens ?? 0;
       const out = t.output_tokens ?? 0;
       const cc = t.cache_create_tokens ?? 0;
+      const cc1h = (t as { cache_create_1h_tokens?: number }).cache_create_1h_tokens ?? 0;
       const cr = t.cache_read_tokens ?? 0;
       const compressed = t.compressed === true;
       const gpt = isOpenAIEvent(t.path);
@@ -953,7 +958,7 @@ export class DashboardState {
         const probeOk = probeStatus === 'ok'
           || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
         haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
-        actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+        actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr, cc1h) : 0;
         // Mirror update(): only credit the cache-modeled counterfactual on
         // compressed rows. Uncompressed/passthrough rows fall back to the
         // actual cost so they show zero saved (no fabricated savings).
@@ -985,6 +990,7 @@ export class DashboardState {
               cr,
               warmR,
               prevCacheableR,
+              cc1h,
             )
           : actualInputEff;
         if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {

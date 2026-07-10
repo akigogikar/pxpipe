@@ -158,13 +158,14 @@ describe('aggregateSessions', () => {
         input_tokens: 5,
         cache_read_tokens: 8_000,
       }),
-      // Probe miss (no cacheable marker): we cannot split prefix from tail, so
-      // we credit NOTHING — the regression guard for the old cacheable=0 →
+      // Probe miss (split failed): excluded by the baseline_probe_status gate,
+      // so we credit NOTHING — the regression guard for the old cacheable=0 →
       // cold_tail=baseline fabrication (would have falsely "saved" ~46000 here).
       ev({
         first_user_sha8: 'aaaaaaaa',
         compressed: true,
         baseline_tokens: 50_000,
+        baseline_probe_status: 'failed',
         input_tokens: 6,
         cache_read_tokens: 40_000,
       }),
@@ -185,12 +186,13 @@ describe('aggregateSessions', () => {
 
   it('reports a real NEGATIVE when cache_create overhead exceeds the prefix saving; probe-miss credits 0', async () => {
     writeEvents(tmp, [
-      // Probe miss: no marker -> credit nothing (was a ~95000-token fabrication
-      // under the old formula). saved 0.
+      // Probe miss: split failed -> the probe-status gate credits nothing (was
+      // a ~95000-token fabrication under the old formula). saved 0.
       ev({
         first_user_sha8: 'bbbbbbbb',
         compressed: true,
         baseline_tokens: 100_000,
+        baseline_probe_status: 'failed',
         input_tokens: 5,
         cache_read_tokens: 90_000,
       }),

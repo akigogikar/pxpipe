@@ -39,5 +39,6 @@ export {
   computeActualInputEff,
   computeBaselineInputEff,
   CACHE_CREATE_RATE,
+  CACHE_CREATE_1H_RATE,
   CACHE_READ_RATE,
 } from './baseline.js';

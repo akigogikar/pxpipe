@@ -20,10 +20,13 @@ describe('computeBaselineInputEff (warmth-aware)', () => {
   const cc = 0;
   const cr = 0;
 
-  it('credits nothing (returns actual) when the probe could not split the prefix', () => {
-    const actual = computeActualInputEff(inp, cc, cr);
-    expect(computeBaselineInputEff(5000, 0, inp, cc, cr, true, 0)).toBe(actual);
-    expect(computeBaselineInputEff(5000, -1, inp, cc, cr, false, 0)).toBe(actual);
+  it('prices cacheable=0 as the full cold body at 1.0× (no-marker rows; probe-miss rows are gated upstream)', () => {
+    // cacheable=0 means "the request carried no cache_control markers", so the
+    // text counterfactual is the whole baseline at the uncached input rate.
+    // Rows where the probe FAILED to split ('partial'/'failed') never reach
+    // this function — the baseline_probe_status gate excludes them upstream.
+    expect(computeBaselineInputEff(5000, 0, inp, cc, cr, true, 0)).toBe(5000);
+    expect(computeBaselineInputEff(5000, -1, inp, cc, cr, false, 0)).toBe(5000);
   });
 
   it('returns 0 for a non-positive baseline', () => {
