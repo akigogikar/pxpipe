@@ -208,4 +208,42 @@ describe('provider-prefixed passthrough routing', () => {
     expect(cap.headers?.get('authorization')).toBe('Bearer local-token');
     expect(cap.headers?.get('x-api-key')).toBeNull();
   });
+
+  it('fails closed (502, zero upstream fetches) on provider-prefixed paths in default config', async () => {
+    // Default deploy: no provider, no explicit upstream. A provider-prefixed
+    // path would otherwise be forwarded to api.anthropic.com carrying the
+    // client's OpenAI credential verbatim — the leak IMPROVEMENT_PLAN §1 closes.
+    let outbound = 0;
+    globalThis.fetch = (async () => {
+      outbound += 1;
+      return new Response('{}', { headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+
+    const res = await createProxy({})(
+      new Request('http://localhost/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer sk-openai-secret' },
+        body: JSON.stringify({ model: 'gpt-fake', messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+    );
+
+    expect(res.status).toBe(502);
+    expect(outbound).toBe(0);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain('provider-prefixed');
+  });
+
+  it('still forwards provider-prefixed paths when an explicit custom upstream is configured', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    const res = await createProxy({ upstream: 'http://ocproxy.test' })(
+      new Request('http://localhost/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer local-token' },
+        body: JSON.stringify({ model: 'gpt-fake', messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(cap.url).toBe('http://ocproxy.test/openai/v1/chat/completions');
+  });
 });

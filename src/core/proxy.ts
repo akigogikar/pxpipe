@@ -699,6 +699,24 @@ export function createProxy(config: ProxyConfig = {}) {
 
     // Transform only known shapes; everything else passes through.
     const providerPrefixed = isProviderPrefixedPath(url.pathname);
+    // Fail closed: provider-prefixed routes (/openai/, /google-ai-studio/,
+    // /compat/, /anthropic/) only have a meaningful upstream when a gateway or
+    // an explicit custom upstream (ocproxy-style) is configured. Otherwise
+    // passthroughUpstream falls back to the DEFAULT Anthropic upstream — which
+    // would forward e.g. a client's OpenAI `Authorization: Bearer sk-…` on
+    // POST /openai/v1/chat/completions straight to api.anthropic.com: a
+    // credential leak plus misroute. Refuse before touching headers or body;
+    // no upstream fetch may fire on this path.
+    if (providerPrefixed && config.provider !== 'cloudflare-ai-gateway' && !config.upstream) {
+      fire(502, undefined, 'provider_prefixed_without_gateway');
+      return new Response(
+        JSON.stringify({
+          error:
+            'pxpipe: provider-prefixed path requires PXPIPE_PROVIDER=cloudflare-ai-gateway (refusing to forward to default upstream)',
+        }),
+        { status: 502, headers: { 'content-type': 'application/json' } },
+      );
+    }
     const isMessages = req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
     const isOpenAIChat = req.method === 'POST' && isOpenAIChatPath(url.pathname);
     const isOpenAIResponses = req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
