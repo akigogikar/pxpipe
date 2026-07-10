@@ -1,0 +1,379 @@
+{
+  "executive_summary": "Eight reviewers produced ~50 findings across the transform engine, render pipeline, network/privacy edge, OpenAI path, accounting, dashboard, evidence base, and CI. Deduplicated, these collapse to 18 initiatives plus quick wins. Two are privacy ship-blockers that break the \"nothing leaves the machine\" promise and must land first: provider-prefixed passthrough silently misroutes `/openai/*` to api.anthropic.com carrying the client's own OpenAI credential, and the Cloudflare Worker defaults to shipping transformed prompt bodies to off-machine Workers Logs on 4xx. The next tier is measurement honesty — the product's reason to exist: baseline.ts undercharges 1h cache-create and zeroes real savings on probe-miss; gpt-5.6 (the default flagship) runs on a placeholder vision profile; the dashboard blends Anthropic and OpenAI token-equivalents under one $/Mtok. Fidelity protection follows: reminders have no image cap (risking 100-image 400s = total task failure), the highest-stakes slab renders on the lower-fidelity 1-bit atlas, fact sheets truncate long histories, and Responses-API item gaps freeze Codex/MCP history collapse. Net-new arbitrage (decoupled gates, adaptive per-bucket cpt, GPT deferred savings) ranks below honesty/fidelity per the north star. The single biggest cross-cutting gap: no fidelity eval runs in CI, so a legibility regression could ship unseen.",
+  "themes": [
+    {
+      "name": "Honest Accounting",
+      "description": "Reported $/savings must be counterfactually true under the same observed cache state as the real request. An overstated number or an unverified price constant is disqualifying — it makes the product a lie regardless of real savings."
+    },
+    {
+      "name": "Fidelity Protection",
+      "description": "Imaged content must never degrade work-done. Exact identifiers, authoritative instructions, and long-lived context must stay legible or recoverable; a misread or a rejected request is negative arbitrage."
+    },
+    {
+      "name": "Privacy & Local-Only",
+      "description": "Nothing leaves the user's machine except to the model provider itself, and on-disk retention is minimal. Credential leaks, off-machine log sinks, and unauthenticated state changes are ship-blockers."
+    },
+    {
+      "name": "Arbitrage Unlock",
+      "description": "Net-new $/token savings from tightening gate math and covering more compressible content — pursued only once honesty and fidelity are protected."
+    },
+    {
+      "name": "Measurement Infrastructure",
+      "description": "Evals, CI gates, dashboards, and committed receipts so both fidelity and savings are measured continuously rather than assumed."
+    },
+    {
+      "name": "Reliability & Network Edge",
+      "description": "The proxy must never become a failure path or an extra-cost path: image caps, abort propagation, honest error signaling, and complete routing coverage."
+    }
+  ],
+  "initiatives": [
+    {
+      "rank": 1,
+      "title": "Fail closed on provider-prefixed passthrough to stop the OpenAI-credential-to-Anthropic leak",
+      "horizon": "now",
+      "theme": "Privacy & Local-Only",
+      "problem": "passthroughUpstream only points at the gateway when config.provider==='cloudflare-ai-gateway'; otherwise it falls back to the Anthropic upstream. isProviderPrefixedPath matches /openai/, /google-ai-studio/, /compat/ regardless of provider, and header injection only overrides keys for /anthropic/. In the default (no PXPIPE_PROVIDER) deploy a POST /openai/v1/chat/completions is forwarded to https://api.anthropic.com carrying the client's Authorization: Bearer sk-… verbatim — a credential leak plus misroute. Only tested with provider='cloudflare-ai-gateway'.",
+      "plan": "1) In proxy.ts where providerPrefixed/upstreamBase are computed (~500-509,710), add a guard: if providerPrefixed && config.provider!=='cloudflare-ai-gateway' return 502 before filterHeaders/body, mirroring the existing readModelField/model-scope fail-closed pattern. 2) Ensure no upstream fetch fires on that path. 3) Extend tests/gateway.test.ts: default config + /openai/v1/chat/completions with an Authorization header must 502 and must NOT reach the Anthropic upstream URL.",
+      "files": [
+        "src/core/proxy.ts",
+        "tests/gateway.test.ts"
+      ],
+      "effort": "S",
+      "expected_effect": "Eliminates a silent credential exfiltration + misroute in the default deployment shape.",
+      "measure": "New regression test proves 0 outbound requests to api.anthropic.com on a provider-prefixed path in default config; add an outbound-host!=intended counter to telemetry that must read 0."
+    },
+    {
+      "rank": 2,
+      "title": "Stop the Cloudflare Worker from shipping transformed prompt bodies to off-machine Workers Logs",
+      "horizon": "now",
+      "theme": "Privacy & Local-Only",
+      "problem": "worker.ts trackingOn defaults true, wiring JsonLogTracker→console.log which Cloudflare ingests as Workers Logs (a third-party managed sink). toTrackEvent unconditionally includes req_body_sample_b64 (gzipped TRANSFORMED prompt/system/tool content) on 4xx under 32KiB, plus cwd/git_branch/os_version. On Node the same data stays on local disk; on Workers it is pushed off-host by default the moment anyone runs the documented wrangler deploy, breaking the 'nothing leaves the machine' story.",
+      "plan": "1) In worker.ts default to a metadata-only tracker: strip req_body_sample_b64/req_body_sample_path/cwd/git_branch/os_version before console.log, keep counts/durations/usage; or default PXPIPE_TRACK=false on Workers and require explicit opt-in. 2) Add a loud comment in worker.ts + README that Workers Logs is an off-machine third-party sink where prompt content can land on errors. 3) Unit test that the Worker track payload contains no body-sample/cwd/git_branch keys by default.",
+      "files": [
+        "src/worker.ts",
+        "src/core/tracker.ts",
+        "README.md",
+        "tests/worker.test.ts"
+      ],
+      "effort": "S",
+      "expected_effect": "Closes the only place in the repo where the local-only privacy claim silently fails; keeps Worker deploys honest by default.",
+      "measure": "Assert emitted Worker event has no req_body_sample_*/cwd/git_branch keys by default; manual Workers Logs inspection on a forced 4xx shows metadata only."
+    },
+    {
+      "rank": 3,
+      "title": "Fix baseline.ts honesty bugs: 1h cache-create rate and probe-miss savings collapse",
+      "horizon": "now",
+      "theme": "Honest Accounting",
+      "problem": "computeActualInputEff prices ALL cache_creation_input_tokens at CACHE_CREATE_RATE=1.25 even 1h-tier tokens Anthropic bills at 2x, so any carried-forward ttl:'1h' marker undercharges actual_eff by 37.5% of those tokens and inflates reported savings by the same amount. Separately the baselineCacheable<=0 early-return substitutes actual_eff (zeroing real savings) for requests that legitimately carried no cache_control, instead of falling through to the correct cold-uncached formula.",
+      "plan": "1) Add CACHE_CREATE_1H_RATE=2.0 and thread cc5m/cc1h (already on event rows as cache_create_5m_tokens/cache_create_1h_tokens) into computeActualInputEff/computeBaselineInputEff. 2) Delete the baselineCacheable<=0 early-return (baseline.ts:109) or replace with `return baseline;` so the existing cold-path formula runs (it already yields the right number at cacheable=0). 3) Extend savings-honesty grid tests to cover 1h-TTL rows and no-cache_control rows.",
+      "files": [
+        "src/core/baseline.ts",
+        "src/dashboard.ts",
+        "src/sessions.ts",
+        "tests/savings-honesty.test.ts"
+      ],
+      "effort": "S",
+      "expected_effect": "Removes fabricated savings on 1h-TTL slabs and stops reporting $0 saved on large genuinely-compressed no-marker rows.",
+      "measure": "Synthetic 1h-TTL event: actual_eff rises by (2.0-1.25)*cc1h; no-cache_control event: baseline_eff equals cold price not actual_eff — both asserted in tests."
+    },
+    {
+      "rank": 4,
+      "title": "Verify gpt-5.6 vision profile and lock model scope to vetted exact ids",
+      "horizon": "now",
+      "theme": "Honest Accounting",
+      "problem": "gpt-5.6 is default-on (DEFAULT_MODEL_BASES) yet its vision profile is an admitted copy-paste placeholder ('day-one retune is one line'), so every gpt-5.6 gate decision and reported $ is computed off an unverified guess. openAICacheReadRate/openAIOutputRate apply gpt-5 ratios to any /^gpt-5/, and isAllowed's startsWith alias auto-admits unvetted variants (e.g. a future -lite snapshot) into the fidelity-audited scope.",
+      "plan": "1) Verify gpt-5.6 multiplier/patchCap from OpenAI vision-billing docs or a live usage payload; update gpt-model-profiles.ts:86-91. Until verified, default gpt-5.6 to the conservative DEFAULT_GPT_PROFILE (over-states cost, biases safe). 2) Replace the regex rate lookup with an explicit per-model-id rate table and an 'unknown model → exclude from savings numerator + warn' path. 3) In applicability.ts:77-81 drop the startsWith alias (exact-match ids) or restrict to a versioned allowlist reviewed alongside FINDINGS.md.",
+      "files": [
+        "src/core/gpt-model-profiles.ts",
+        "src/core/openai-savings.ts",
+        "src/core/applicability.ts"
+      ],
+      "effort": "S",
+      "expected_effect": "Makes the default flagship's accounting honest and prevents silent scope creep to unaudited model variants.",
+      "measure": "Recompute gate decisions/reported $ against the verified profile; test that an unlisted gpt-5.x id is excluded from the savings numerator and a -lite-style alias is rejected by the scope gate."
+    },
+    {
+      "rank": 5,
+      "title": "Partition dashboard $ by provider and pin price constants with regression tests",
+      "horizon": "now",
+      "theme": "Honest Accounting",
+      "problem": "update() feeds both Anthropic (Anthropic-priced) and GPT (GPT-priced ~$1.25/Mtok, 0.1x cache read) effective tokens into the SAME weighted accumulators, then serveStats multiplies by one Fable-5 ASSUMED_INPUT_USD_PER_MTOK=$10 and an Anthropic-only 5x output multiplier — up to ~8x mis-stated saved_usd on mixed fleets. The constants have zero regression coverage despite a documented $2.50→$5 drift incident, plus a dead duplicate INPUT_USD_PER_MTOK in fragments.ts:145.",
+      "plan": "1) Split compressed/passthrough weighted pools by provider (isOpenAIEvent exists at dashboard.ts:352), apply each pool's own $/Mtok (add OPENAI_INPUT_USD_PER_MTOK) and own output multiplier, and sum DOLLARS not tokens for the headline. 2) Show a per-provider breakdown in the math drawer. 3) Add tests/pricing-constants.test.ts pinning ASSUMED_INPUT_USD_PER_MTOK/OUTPUT_TOKEN_RATE/OPENAI_GPT5_OUTPUT_RATE/OPENAI_GPT5_CACHE_READ_RATE and asserting saved_usd==saved_tokens*rate/1e6; delete the dead fragments.ts:145 duplicate.",
+      "files": [
+        "src/dashboard.ts",
+        "src/dashboard/fragments.ts",
+        "src/core/openai-savings.ts",
+        "tests/pricing-constants.test.ts"
+      ],
+      "effort": "M",
+      "expected_effect": "Headline $ figures stop being fabricated on mixed fleets; a future silent constant edit fails CI loudly.",
+      "measure": "Mixed-fleet synthetic events: headline saved_usd equals the sum of per-provider dollar totals within rounding; constants test fails on any unaccompanied edit."
+    },
+    {
+      "rank": 6,
+      "title": "Add a request-level image ceiling: reminder cap, 100-image budget, and history cap",
+      "horizon": "now",
+      "theme": "Fidelity Protection",
+      "problem": "The reminder path calls textToImageBlocks with no truncateForBudget and no cap (a 620KB reminder produced 23 images); the tool_result path over-emits (~2x its maxImagesPerToolResult) because truncateForBudget geometry diverges from the real renderer; and history.ts has no image ceiling. Summed per-block caps can still cross Anthropic's 100-image/request ceiling, which rejects the whole request with a 400 — total task failure, the worst-case negative arbitrage.",
+      "plan": "1) Apply truncateForBudget(text, cap, denseGeo.cols, numCols, denseGeo.maxChars) to the reminder path before textToImageBlocks with a maxImagesPerReminder cap. 2) Add a request-level running image counter across slab+reminder+tool_result+history that stops/truncates as the total nears 100. 3) Reconcile truncateForBudget's row/char math with shrinkColsToContent+renderTextToPngsWithCharLimit so the existing tool_result cap is actually honored. 4) Add a max-image ceiling to HistoryCollapseOptions with a history_reason telemetry value when hit.",
+      "files": [
+        "src/core/transform.ts",
+        "src/core/history.ts",
+        "src/core/render.ts"
+      ],
+      "effort": "M",
+      "expected_effect": "Removes an unguarded path to full-request 400 rejection and makes per-block caps trustworthy.",
+      "measure": "Property test: total images ≤ cap for an adversarial 620KB reminder plus many tool_results; per-block emitted images ≤ configured cap; keep a 400-rejection-rate metric at 0."
+    },
+    {
+      "rank": 7,
+      "title": "Render the system/tool slab on the anti-aliased atlas and resolve atlas-gray bundling",
+      "horizon": "now",
+      "theme": "Fidelity Protection",
+      "problem": "The slab (system prompt + tool schemas — highest-stakes, every-turn content: tool names, CLI flags, exact schema field names) is rendered via renderTextToPngs with no style at transform.ts:1808 and openai.ts:684/891, silently falling back to the 1-bit atlas rather than the AA atlas the docstrings say production fidelity depends on. Meanwhile atlas-gray.ts (4.09MB) is unconditionally bundled with a false 'EVAL-ONLY / NOT imported' banner, and the Workers 1MB compressed-bundle budget was tuned without it.",
+      "plan": "1) Pass DENSE_RENDER_STYLE ({aa:true}) at the three slab call sites. 2) Re-run L1 OCR on slab-shaped content (headers/CLI flags/schema JSON) to confirm the 98.95% figure holds before shipping. 3) Since AA is now definitively production, delete the stale banner in scripts/gen-atlas.ts and re-measure the Workers compressed bundle including atlas-gray.ts; if over budget, make atlas-gray a lazy `await import('./atlas-gray.js')` gated on first aa use.",
+      "files": [
+        "src/core/transform.ts",
+        "src/core/openai.ts",
+        "src/core/render.ts",
+        "scripts/gen-atlas.ts",
+        "wrangler.toml"
+      ],
+      "effort": "M",
+      "expected_effect": "Moves the content most likely to cause silent instruction-following failures onto the higher-fidelity render path and unblocks/derisks Workers deploys.",
+      "measure": "Slab-content L1 OCR ≥ 98.95%; Workers compressed bundle size re-measured against the 1MB cap; cold-isolate decode CPU unchanged or reduced."
+    },
+    {
+      "rank": 8,
+      "title": "Swap production fact-sheet callers to the page-aware variant and surface dropped counts",
+      "horizon": "now",
+      "theme": "Fidelity Protection",
+      "problem": "Every production caller uses single-pass factSheetText, which truncates input >262,144 chars (MAX_SCAN) before extraction and keeps only 64 identifiers globally. Collapsed multi-page histories routinely exceed 262k chars, so the exact-identifier sidecar silently stops scanning partway — the blind spot grows with session length, the opposite of what a long-lived-context protection should do.",
+      "plan": "1) Swap history/tool_result fact-sheet call sites (transform.ts:1940/1961/2028/2089; openai.ts:713/759/918/999; history.ts:644) to extractFactSheetEntriesAllPages(text, DENSE_CONTENT_CHARS_PER_IMAGE) for full-text coverage under one global priority budget. 2) Surface the returned `dropped` count in TransformInfo/telemetry so the 64-token cap being hit becomes visible instead of silent.",
+      "files": [
+        "src/core/factsheet.ts",
+        "src/core/transform.ts",
+        "src/core/openai.ts",
+        "src/core/history.ts"
+      ],
+      "effort": "S",
+      "expected_effect": "Long sessions get verbatim-identifier backup across the whole imaged transcript instead of a silent cutoff at 262k chars.",
+      "measure": "Test: a >262k-char transcript yields identifiers from its last page in the sheet (fails today); telemetry exposes dropped>0 events for operators."
+    },
+    {
+      "rank": 9,
+      "title": "Add CSRF protection to dashboard state-changing endpoints",
+      "horizon": "now",
+      "theme": "Privacy & Local-Only",
+      "problem": "POST /fragments/toggle and /fragments/models accept application/x-www-form-urlencoded with no auth, no Origin/Referer check, and no CSRF token. A cross-origin simple-request form on any webpage the user has open can flip dashboard.compressionEnabled or the model scope on 127.0.0.1 — the loopback-only warning does not address same-machine drive-by CSRF.",
+      "plan": "1) Print a random startup token and require it as a header on all state-changing POSTs, or reject requests whose Origin/Referer isn't the dashboard's own origin. 2) Stop accepting form-urlencoded for these endpoints — JSON-only plus a required X-Requested-With header (htmx can send it), which defeats simple-request CSRF. 3) Tests: cross-origin/form POST rejected; same-origin htmx POST still succeeds.",
+      "files": [
+        "src/node.ts",
+        "src/dashboard.ts",
+        "src/dashboard/fragments.ts"
+      ],
+      "effort": "S",
+      "expected_effect": "Prevents a drive-by webpage from silently disabling compression or widening model scope on the user's machine.",
+      "measure": "Test asserts 403 on missing token / foreign Origin and success from the real dashboard UI."
+    },
+    {
+      "rank": 10,
+      "title": "Decouple reminder/tool_result compression from the static-slab's own gates",
+      "horizon": "now",
+      "theme": "Arbitrage Unlock",
+      "problem": "The system-reminder (5a) and tool_result (5b) compaction loops are nested inside the slab's two early-return gates (minCompressChars and isCompressionProfitable). A system prompt under ~2000 chars silences ALL reminder/tool_result compression for that turn even when a single tool_result is hundreds of KB and independently profitable — verified: the same 31.2k-char tool_result compresses with a large system slab but not a small one. runHistoryCollapseAndFinalize already runs from both early-return branches; reminders/tool_results never got that treatment.",
+      "plan": "1) Move the reminder (~1889) and tool_result (~1971) loops out of the `if(combined.length<minCompressChars)` and `if(!isCompressionProfitable)` return branches so they always execute, mirroring runHistoryCollapseAndFinalize. 2) Keep the slab image/system-splice logic skippable independently of reminder/tool_result processing. 3) Add render.test.ts cases with a short system prompt plus a large profitable tool_result asserting toolResultImgs>0.",
+      "files": [
+        "src/core/transform.ts",
+        "tests/render.test.ts"
+      ],
+      "effort": "M",
+      "expected_effect": "Restores the reminder+tool_result arbitrage lever for every minimal/custom-agent turn and any turn where the slab was already gated out.",
+      "measure": "The exact 31.2k-char tool_result now yields toolResultImgs:1 under a small slab (matching the large-slab result); new small-slab tests pass."
+    },
+    {
+      "rank": 11,
+      "title": "Wire the built 4xx-body retention lifecycle (prune, rotation, opt-in, redaction)",
+      "horizon": "next",
+      "theme": "Privacy & Local-Only",
+      "problem": "On any 4xx, the transformed prompt body is gzipped into events.jsonl or ~/.pxpipe/4xx-bodies sidecars with no TTL and no directory size cap. sessions.ts ships a full prune()/selectSessionsToRemove()/diskUsage() API that is wired to nothing (no CLI, no HTTP surface), and tracker.ts's header falsely claims it 'never emits raw text.'",
+      "plan": "1) Wire prune()/diskUsage() to a `pxpipe sessions prune` CLI and a dashboard DELETE endpoint with a delete affordance in renderSessionsFragment. 2) Give the 4xx-bodies directory the same size-based rotation FileTracker already applies to events.jsonl. 3) Gate body-sample capture behind PXPIPE_TRACK_BODY_SAMPLES (off by default) with secret-pattern redaction before persisting. 4) Fix the tracker.ts:3-5 header to describe actual retention. 5) Surface diskUsage() on the dashboard.",
+      "files": [
+        "src/sessions.ts",
+        "src/node.ts",
+        "src/core/tracker.ts",
+        "src/dashboard.ts",
+        "src/dashboard/fragments.ts"
+      ],
+      "effort": "M",
+      "expected_effect": "Bounds on-disk conversation-content retention and makes it visible/prunable, matching the minimal-retention privacy lever.",
+      "measure": "prune CLI shrinks the sidecar dir; dashboard shows disk usage; default run writes no raw body; a redaction test removes a seeded secret before write."
+    },
+    {
+      "rank": 12,
+      "title": "Run fidelity evals in CI, re-validate the shipped render style on L2, and fix reproducibility",
+      "horizon": "next",
+      "theme": "Measurement Infrastructure",
+      "problem": "No eval runs in CI (grep of workflows for 'eval' returns nothing) — the north star's 'fidelity is measured, never assumed' has no enforcement. The shipped 'reflow-inimage' style was never re-validated on L2; the only committed L2 report says 'do not ship' (51% judge / 30% pass) for the plain reflow variant, and production has run on the un-gated variant for ~6 weeks. gpt-5.6 has zero read-fidelity evidence despite a CHANGELOG OCR-gate claim, and verbatim-15/run.sh plus the README 59%/70% numbers aren't reproducible from a clean checkout.",
+      "plan": "1) Add a scheduled/manual GitHub Action running eval-l1-ocr.mjs on a small fixed corpus with a cheap model behind a repo secret, failing if edit-distance exceeds a threshold. 2) Re-run eval-l2-session.mjs on the current in-image renderer; commit refreshed l1/l2 reports + summary.md, and flag the stale 'do not ship' checklist. 3) Build a minimal GPT mirror of verbatim-15 + gist-recall via /v1/responses for gpt-5.6. 4) Fix eval/verbatim-15/run.sh to `cd \"$(dirname \"$0\")\"`; commit a privacy-safe aggregate receipt for the 59%/70% snapshot; run bench/run.sh once and commit bench/runs.",
+      "files": [
+        ".github/workflows/ci.yml",
+        "eval/eval-l1-ocr.mjs",
+        "eval/eval-l2-session.mjs",
+        "eval/verbatim-15/run.sh",
+        "eval/results/summary.md",
+        "README.md",
+        "bench/run.sh"
+      ],
+      "effort": "M",
+      "expected_effect": "A legibility regression (font/DPI/reflow/renderer bug) is caught automatically, and the headline fidelity/savings claims become reproducible and current.",
+      "measure": "CI L1 job gates on threshold weekly; committed L2 report ≥ ship gate (or scope narrowed); verbatim-15 reproduces 13/15 from a fresh checkout; gpt-5.6 fidelity numbers exist in-repo."
+    },
+    {
+      "rank": 13,
+      "title": "Surface captured fidelity signals and passthrough reasons in stats and the dashboard",
+      "horizon": "next",
+      "theme": "Measurement Infrastructure",
+      "problem": "safety_flagged, truncated_tool_results, omitted_chars, dropped_chars/dropped_codepoints_top, and per-request reason/skipReasons are captured on every event but never aggregated by stats.ts/sessions.ts or rendered by the dashboard — the one place meant to catch 'compression broke something' is blind to it, and a power user staring at a passthrough-heavy session can't see why.",
+      "plan": "1) Add counters to stats.ts fold()/Summary (safetyFlaggedCount, truncatedToolResultEvents, totalOmittedChars, totalDroppedChars). 2) Render a 'Fidelity' row group in summaryToJson()/renderStatsTableFragment and a red banner on recent-requests rows with safety_flagged=true. 3) Add reason?: string to RecentRow, thread info?.reason through update()/replay(), render it as a tooltip on the 'text' badge, and render the already-shipped skipReasons top-5 in renderStatsTableFragment.",
+      "files": [
+        "src/stats.ts",
+        "src/dashboard.ts",
+        "src/dashboard/fragments.ts",
+        "src/dashboard/types.ts"
+      ],
+      "effort": "S",
+      "expected_effect": "Operators can correlate a refusal/truncation/glyph-drop spike with a compression change in real time instead of grepping JSONL days later.",
+      "measure": "Seeded safety_flagged event shows a red banner + incremented count; a passthrough-heavy fixture renders its reason distribution in the UI."
+    },
+    {
+      "rank": 14,
+      "title": "Lower Responses-API built-in item types and guard images so Codex/MCP history collapses again",
+      "horizon": "next",
+      "theme": "Arbitrage Unlock",
+      "problem": "responsesItemToTurn only special-cases reasoning/function_call/function_call_output; local_shell_call, mcp_call, computer_call, web_search_call fall to the opaque catch-all, and findClosedBoundary/isClosedPrefix treat any opaque item as a hard stop. Since clients resend the full transcript each turn, the FIRST shell/MCP call permanently freezes history collapse for the whole session — nullifying the feature for the stated target workload. Separately, image parts in collapsed turns become a '[image]' placeholder and the bytes are silently lost.",
+      "plan": "1) Lower self-contained items (mcp_call, web_search_call, file_search_call, code_interpreter_call, image_generation_call, inline local_shell_call) as plain non-opaque turns; lower paired items (local_shell_call/_output, computer_call/_output, custom_tool_call/_output) via call_id open/close like function_call. Mirror in chatMessageToTurn. 2) Mark image-bearing turns opaque so collapse stops before them rather than dropping bytes. 3) Keep the opaque fallback only for genuinely unknown types. 4) Add tests for a Codex shell-loop transcript collapsing past the first shell call.",
+      "files": [
+        "src/core/openai-history.ts",
+        "tests/openai-history.test.ts"
+      ],
+      "effort": "M",
+      "expected_effect": "Restores history-collapse savings from ~0% back to the designed 'bulk of transcript' on Codex/MCP agent sessions and stops silent image loss.",
+      "measure": "Synthetic Codex transcript with N shell calls collapses to the expected boundary (frozen at turn 1 today); an image-bearing turn stays live instead of losing bytes."
+    },
+    {
+      "rank": 15,
+      "title": "Wire per-bucket adaptive cpt into the reminder/tool_result gate and fix the phantom-header token count",
+      "horizon": "next",
+      "theme": "Arbitrage Unlock",
+      "problem": "Reminder/tool_result gates use o.charsPerToken (default CHARS_PER_TOKEN=4) even though the slab/history constants are calibrated at 2.0 from telemetry and the file already emits bucketChars.tool_result_json/log — JSON/log content plausibly tokenizes ~2x denser, so the gate likely rejects roughly half of truly-profitable structured/log tool_results (file reads, search results, test output). ADAPTIVE_CPT_PLAN Phase 1 is 'locked, not implemented.' Separately, the slab gate charges pxpipe's own 778-868-char instruction header (~389-434 phantom tokens) to the text-side baseline, biasing the image path more profitable than the honest counterfactual.",
+      "plan": "1) Ship ADAPTIVE_CPT_PLAN Phase 1 bucket_chars telemetry; run the regression that produced SLAB/HISTORY_CHARS_PER_TOKEN against bucketChars.tool_result_json/log; wire per-bucket cpt into isCompressionProfitable at transform.ts:1999/2065 (move classifyContent(inner) before the gate). 2) Fix phantom-token accounting: derive imageTokens from combinedWithHeader but textTokens from combined alone via an optional textBasis param on evalCompressionProfitability/isCompressionProfitable.",
+      "files": [
+        "src/core/transform.ts",
+        "docs/ADAPTIVE_CPT_PLAN.md",
+        "tests/savings-honesty.test.ts"
+      ],
+      "effort": "M",
+      "expected_effect": "Correctly images the largest compressible bucket (structured/log tool_results) that the conservative cpt currently passes through, with no render-path/fidelity change.",
+      "measure": "Before/after count of structured tool_results imaged on a fixed session; gate unchanged on large slabs; marginal-slab false-profitables removed; observed vs assumed per-bucket cpt tracked continuously."
+    },
+    {
+      "rank": 16,
+      "title": "Wire sharp.ts exact-string protection into production behind an eval gate",
+      "horizon": "next",
+      "theme": "Fidelity Protection",
+      "problem": "sharp.ts (extractSharp/restoreSharp/renderSidecar/sharpDensity) is built, tested, and measured to fix a near-total OCR failure (6/15 dense-hex recall vs 100/100 with protection), but no production entrypoint invokes it — keepSharp defaults to ()=>false. The measured silent-wrong-answer failure mode on hashes/UUIDs/paths is completely unmitigated for real requests today.",
+      "plan": "1) Use span-level extractSharp/restoreSharp so only exact-string spans stay text (protecting a block without abandoning its imaging savings), backed by renderSidecar alongside factSheetText; default keepSharp via a sharpDensity threshold in transform.ts/openai.ts. 2) Cap sharp span extraction so protected text can't grow unbounded. 3) Gate the default-on flip behind eval-l1-ocr.mjs confirming the dense-hex/UUID recall win before shipping.",
+      "files": [
+        "src/core/sharp.ts",
+        "src/core/transform.ts",
+        "src/core/openai.ts",
+        "eval/eval-l1-ocr.mjs"
+      ],
+      "effort": "M",
+      "expected_effect": "Realizes a measured near-total recovery of exact-identifier recall for a small, quantified imaging-savings cost on exactly the content where a misread is unrecoverable.",
+      "measure": "Eval shows dense-hex/UUID/path recall restored (~100%) with the imaging-savings delta quantified; telemetry shows sharp spans applied on real requests."
+    },
+    {
+      "rank": 17,
+      "title": "Network-edge robustness: abort propagation, honest stream errors, and multi-host MITM",
+      "horizon": "later",
+      "theme": "Reliability & Network Edge",
+      "problem": "The upstream fetch never receives a signal, so a client Ctrl-C/disconnect keeps Anthropic generating and billing full output — worse than the no-proxy baseline. Non-abort mid-stream errors after headers are sent call res.end(), producing a transport-valid but content-truncated response the client can't distinguish from a real completion. And MITM only TLS-terminates api.anthropic.com, so Codex/OpenAI-desktop CONNECT traffic is raw-tunnelled with 0% savings.",
+      "plan": "1) Thread an AbortController per request (Node: req/res 'close'; Worker: Request.signal) into the main fetch and countTokensUpstream, keeping tee-based usage scanning for normal completions. 2) In the requestHandler catch, when headersSent is true call res.destroy(err) instead of res.end(). 3) Generalize ensureCa/leafSecureContextInput to a per-host leaf cert cache with SNICallback and add api.openai.com to MITM_HOSTS (after confirming Codex Desktop pins its base URL like Claude Desktop).",
+      "files": [
+        "src/core/proxy.ts",
+        "src/node.ts",
+        "src/worker.ts",
+        "src/core/connect-route.ts",
+        "src/core/mitm.ts",
+        "src/core/mitm-ca.ts"
+      ],
+      "effort": "M",
+      "expected_effect": "Stops burning full output-token price on abandoned requests, surfaces truncations as real errors, and extends compression to OpenAI-desktop CONNECT clients.",
+      "measure": "Abort test: client disconnect closes the upstream socket (track % aborts-propagated); truncation test: client sees a hard connection error not a clean 200; OpenAI CONNECT traffic shows non-zero compression."
+    },
+    {
+      "rank": 18,
+      "title": "GPT deferred savings: realistic gate height, schema-delta tool docs, and history rollup",
+      "horizon": "later",
+      "theme": "Arbitrage Unlock",
+      "problem": "evalOpenAIGate prices every estimated image at full max-height (1932px), a >3x overestimate that biases small/medium content — the common ~1-page case — toward false 'not_profitable'. renderToolDoc images the FULL original schema (structure + descriptions) though the native stripped copy already carries structure, wasting vision tokens for schema-heavy MCP tools. And GPT_HISTORY_MAX_IMAGES=16 freezes collapse forever for the longest, highest-$ sessions with no rollup.",
+      "plan": "1) Replace evalOpenAIGate's max-height assumption (openai.ts:479) with an expected-height estimate from row-count/line-height, matching how render.ts splits pages. 2) Image only the removed description/title/examples/default delta plus heading, not the full re-serialized parameters (openai.ts:329-346). 3) Add a generational rollup: merge the N oldest frozen history sections into one archived image, re-rendered infrequently, to free image-count budget instead of freezing collapseEnd.",
+      "files": [
+        "src/core/openai.ts",
+        "src/core/openai-history.ts",
+        "src/core/gpt-model-profiles.ts"
+      ],
+      "effort": "L",
+      "expected_effect": "Recovers a measurable band of medium content wrongly passed through, cuts MCP tool-doc vision tokens ~50-75%, and keeps long sessions compressing past the ~32k-token ceiling.",
+      "measure": "Gate A/B flips a measured band of medium content to profitable; tool-doc vision tokens for MCP-heavy tools drop; fraction of long-session transcript kept compressed no longer decays to 0."
+    }
+  ],
+  "quick_wins": [
+    "Fix eval/verbatim-15/run.sh: use `cd \"$(dirname \"$0\")\"` and read local page*.png so `bash eval/verbatim-15/run.sh` reproduces the cited 13/15 from a clean checkout (currently reads /tmp/verb25).",
+    "Extract a single runHistoryCollapse(req,info,o,opts,dropped,protectedPrefix) helper for the two duplicated call sites (transform.ts:1432 vs :2132) — kills the exact duplicated-gate bug class the file documents shipping once (priorWarmImageTokens fix).",
+    "Replace the churn-detector 'global' fallback key (transform.ts:1639) with a per-process random instance id (or skip observation) so unrelated sessions never share a churn bucket.",
+    "Set process.umask(0o077) around the openssl key-writing calls in mitm-ca.ts (65-91) with a finally-restore, closing the creation-time world-readable TOCTOU window before the trailing chmod 0600.",
+    "Cap the proxy request-body read with a 413 above ~25-32MB before arrayBuffer() (proxy.ts:725), mirroring the dashboard's existing 1MiB cap, to prevent memory-exhaustion DoS on HOST=0.0.0.0.",
+    "Set GPT_MAX_HEIGHT_PX 1932→1920 (=60×32) in gpt-model-profiles.ts for clean 32px patch alignment (~1.6-1.7% off every full-height GPT-5.x page) plus a regression assertion; or round maxHeightPx down to patch granularity in render.ts.",
+    "Point DEFAULT_EXPORT_MODEL (export.ts:33) and the render.ts geometry measurement comment at applicability.ts's DEFAULT_MODEL_BASES via one shared constant so a future production-model change forces re-measurement.",
+    "Update the shrinkColsToContent JSDoc + docs/RENDER_SIZING.md to describe live shrink-to-content (not the stale 'no-op' claim), remove the stale eslint-disable, and fix renderDensePages's caller-graph docstring.",
+    "Replace docs/TRANSFORM_INFO.md §8 with a one-line pointer to docs/CACHING_AND_SAVINGS.md (it cites removed effectiveCost/baselineCost and the old 4761-token geometry).",
+    "Drop 'EXPECTED FAIL today' from the describe titles in tests/anthropic-cache-align.test.ts:104 and tests/gpt-cache-align.test.ts:91 — all 20 tests now pass.",
+    "Delete the dead SessionTotals Map / baselineWarmth bookkeeping / current-session.json endpoint (or wire it into a real per-session panel) and fix the stale doc comment at dashboard.ts:1062; the insertion-order eviction can evict the active session out from under a live caller.",
+    "Add a shared waitFor(predicate,{timeoutMs,intervalMs}) test helper and replace the ~30 fixed setTimeout(20/30) sync points on the fire-and-forget onRequest callback — faster on the happy path and immune to CI-load flakiness."
+  ],
+  "eval_agenda": [
+    "L2 comprehension re-run on the shipped 'reflow-inimage' variant. Hypothesis: the +1.04pp L1 OCR lift carries to L2 judge score ≥65% / pass ≥60%, clearing the 'do not ship' gate that only the plain-reflow variant was ever measured against.",
+    "GPT-5.6 read-fidelity mirror (verbatim-15 + gist-recall via /v1/responses). Hypothesis: gpt-5.6 reads imaged context at parity with Fable-5, justifying its default-on scope; otherwise narrow DEFAULT_MODEL_BASES to claude-fable-5.",
+    "gpt-5.6 real vision-billing verification (live usage payload vs the placeholder patch/multiplier/patchCap). Hypothesis: real numbers differ >20-30% from the copied placeholder, changing gate decisions and every reported $ for the default config.",
+    "Per-bucket cpt regression on bucketChars.tool_result_json/log telemetry. Hypothesis: structured/log tool_results tokenize near 1.9 cpt not the assumed 4.0, so the gate currently rejects roughly half of truly-profitable structured/log tool_results.",
+    "Slab-shaped OCR eval on AA vs 1-bit atlas (headers/CLI flags/schema JSON). Hypothesis: the AA path holds ≥98.95% and beats 1-bit on slab content, confirming it is safe to move the slab onto AA.",
+    "sharp.ts span-level protection A/B on dense-hex/UUID/path recall. Hypothesis: span-level protection restores near-100% exact-string recall (vs measured 6/15) at a negligible imaging-savings loss.",
+    "OpenAI gate realistic-height vs full-height A/B. Hypothesis: partial-page pricing flips a measurable band (350-1190 tok tile regime) of small/medium content from not_profitable→profitable with no fidelity change.",
+    "Cache-alignment bench (bench/run.sh --turns 20 across a collapseChunk boundary). Hypothesis: prefix_flips≈0 / one-time burn then warm reads, validating docs/HISTORY_CACHE_MODEL.md empirically for the first time.",
+    "o200k ground-truth sweep at [2k, 20k, 60k, >largest chunk boundary]. Hypothesis: baselineImagedTokens matches the real o200k count within tolerance at every size, not only the single 60k case tested today.",
+    "PNG adaptive scanline filter (Up / best-of-5) IDAT-size A/B on real rendered pages. Hypothesis: adaptive filtering measurably shrinks base64 payload vs filter=None — or confirms the win is negligible under deflate and should not ship."
+  ],
+  "privacy_posture": [
+    "Fail closed on provider-prefixed routes when config.provider !== 'cloudflare-ai-gateway' (502 before touching headers/body); regression test that no client OpenAI credential ever reaches the Anthropic upstream.",
+    "Worker: default PXPIPE_TRACK to metadata-only (drop req_body_sample_b64/req_body_sample_path/cwd/git_branch/os_version) or PXPIPE_TRACK=false, with a loud README/worker.ts carve-out that Workers Logs is an off-machine third-party sink.",
+    "Local 4xx body samples: gate behind PXPIPE_TRACK_BODY_SAMPLES (off by default), add secret-pattern redaction before persisting, size-rotate the 4xx-bodies dir, and wire prune()/diskUsage() to a CLI + dashboard; correct tracker.ts's false 'never emits raw text' header.",
+    "Dashboard CSRF: require a startup shared-secret header or a strict Origin/Referer check on state-changing POSTs; stop accepting form-urlencoded — JSON-only plus X-Requested-With.",
+    "CA/leaf key creation: set umask 0o077 around the openssl calls so private keys land at 0600 from creation, closing the TOCTOU window the module's own threat model depends on.",
+    "Add a 413 request-body cap on the network-facing proxy path (HOST=0.0.0.0 is a supported mode) to match the dashboard's existing defensive cap.",
+    "Keep the model-scope gate exact-match (drop the startsWith alias) so an unvetted sibling model can never silently enter the fidelity-audited imaging scope."
+  ],
+  "metrics": [
+    "$/work-done arbitrage, partitioned Anthropic vs OpenAI, each priced by its own input $/Mtok and output multiplier (never a single blended rate).",
+    "Savings-honesty guardrails as live asserts: never claim more-warm-than-cold, o200k/count_tokens deviation ≤ tolerance, negative rows surfaced not floored, cache-create split priced 5m (1.25x) vs 1h (2x).",
+    "Fidelity incident rates per 1k requests: safety_flagged, truncated_tool_results, omitted_chars, dropped_chars, dropped_codepoints_top, plus factsheet dropped-token events.",
+    "Passthrough reason distribution: below_threshold / not_profitable / unsupported_model / below_min_chars, per session and aggregate.",
+    "Images-per-request distribution vs Anthropic's 100-image ceiling, and the 400-rejection rate (target 0).",
+    "Observed per-bucket chars-per-token (slab / history / tool_result_json / tool_result_log / tool_result_prose / reminder) vs the constants the gate is using.",
+    "Cache health: prefix_flips, cold_restarts, flip_waste_tokens, and cache_read vs cache_create token split.",
+    "Client-abort rate and the percentage of aborts propagated to the upstream fetch (avoiding billed-but-unread output).",
+    "On-disk footprint: events.jsonl size and the 4xx-bodies sidecar directory size via diskUsage(), surfaced on the dashboard."
+  ]
+}
