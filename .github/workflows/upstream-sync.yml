@@ -1,0 +1,44 @@
+# Sync the fork with teamchong/pxpipe — runs weekly and on demand ("at anytime"
+# via the Actions tab -> Run workflow, optionally with a single PR number).
+name: upstream-sync
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Upstream PR number to cherry-pick (empty = merge everything)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Sync from upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REMOTE: upstream
+          FORK_REMOTE: origin
+          FORK_REPO: ${{ github.repository }}
+        run: |
+          git config user.name "upstream-sync[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/teamchong/pxpipe.git
+          if [ -n "${{ inputs.pr }}" ]; then
+            scripts/sync-upstream.sh pr "${{ inputs.pr }}"
+          else
+            scripts/sync-upstream.sh merge
+          fi
