@@ -67,6 +67,79 @@ describe('toTrackEvent', () => {
     expect(out.ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
+  it('strips prompt-bearing and machine-identifying fields when sensitive:false (Worker default)', () => {
+    // The Cloudflare Worker ships events to Workers Logs — off-machine. Its
+    // tracker must never carry raw prompt text or the caller's machine
+    // identity unless PXPIPE_TRACK_BODY_SAMPLES is set. IMPROVEMENT_PLAN §2.
+    const ev: ProxyEvent = {
+      method: 'POST',
+      path: '/v1/messages',
+      status: 400,
+      durationMs: 50,
+      error: 'upstream 400',
+      errorBody: '{"error":{"message":"messages.0: quoted prompt text here"}}',
+      reqBodySha8: 'abcd1234',
+      reqBodyGz: new Uint8Array([1, 2, 3, 4]),
+      reqBodySamplePath: undefined,
+      info: {
+        compressed: false,
+        reason: 'error',
+        env: {
+          cwd: '/Users/me/secret-project',
+          isGitRepo: true,
+          gitBranch: 'feature/secret',
+          platform: 'darwin',
+          osVersion: 'Darwin 25.4.0',
+          today: '2026-07-10',
+        },
+      },
+    };
+
+    const out = toTrackEvent(ev, { sensitive: false });
+    // Forbidden keys must be ABSENT (not just empty) so JSONL rows can be
+    // audited with a key scan.
+    for (const k of [
+      'req_body_sample_b64',
+      'req_body_sample_path',
+      'error_body',
+      'cwd',
+      'git_branch',
+      'os_version',
+    ]) {
+      expect(out).not.toHaveProperty(k);
+    }
+    // Metadata still flows: status, error string, hashes, coarse env.
+    expect(out.status).toBe(400);
+    expect(out.error).toBe('upstream 400');
+    expect(out.req_body_sha8).toBe('abcd1234');
+    expect(out.platform).toBe('darwin');
+    expect(out.is_git_repo).toBe(true);
+    expect(out.today).toBe('2026-07-10');
+
+    // Default (Node, on-disk) and explicit opt-in keep the fields.
+    for (const full of [toTrackEvent(ev), toTrackEvent(ev, { sensitive: true })]) {
+      expect(full.error_body).toContain('quoted prompt text');
+      expect(full.req_body_sample_b64).toBeTruthy();
+      expect(full.cwd).toBe('/Users/me/secret-project');
+      expect(full.git_branch).toBe('feature/secret');
+      expect(full.os_version).toBe('Darwin 25.4.0');
+    }
+  });
+
+  it('sensitive:false also suppresses the Node sidecar path reference', () => {
+    const out = toTrackEvent(
+      {
+        method: 'POST',
+        path: '/v1/messages',
+        status: 422,
+        durationMs: 10,
+        reqBodySamplePath: '/home/me/.pxpipe/4xx-bodies/x.json.gz',
+      },
+      { sensitive: false },
+    );
+    expect(out).not.toHaveProperty('req_body_sample_path');
+  });
+
   it('captures the nested cache_creation split and server_tool_use counters', () => {
     // Anthropic's `usage` block carries some fields inline and others nested
     // under `cache_creation` / `server_tool_use`. The flat 4-field view we

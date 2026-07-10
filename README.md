@@ -154,6 +154,20 @@ returns the originals of imaged blocks. Pure-JS runtime (Node and
 edge/Workers); `@napi-rs/canvas` is build-time only. Full API:
 `src/core/index.ts`.
 
+## Cloudflare Worker: tracking is metadata-only
+
+The Node host logs to `~/.pxpipe/events.jsonl` — your disk. The Worker logs
+via `console.log`, which Cloudflare ingests as **Workers Logs: an
+off-machine, third-party sink**. On 4xx errors a full track event would
+carry the gzipped transformed prompt body (`req_body_sample_b64`), the
+upstream error body (which can quote your prompt back), and your machine's
+`cwd`/`git_branch`/`os_version`. The Worker therefore strips all of these by
+default and ships only counts, durations, usage, and sha256 prefixes.
+
+Set `PXPIPE_TRACK_BODY_SAMPLES=1` on the Worker **only** if you accept that
+prompt content can land in Cloudflare's log pipeline on errors. Set
+`PXPIPE_TRACK=0` to disable event logs entirely.
+
 ## Development
 
 ```bash

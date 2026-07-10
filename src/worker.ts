@@ -37,8 +37,19 @@ export interface Env {
   MULTI_COL?: string;
   /** When "0" / "false", disable per-request event JSON logs. Default-on.
    *  Cloudflare ingests console.log as Workers Logs; pipe via Logpush to
-   *  R2/S3 for the same JSONL shape Node writes to disk. */
+   *  R2/S3 for the same JSONL shape Node writes to disk.
+   *
+   *  PRIVACY: Workers Logs is an OFF-MACHINE, third-party sink. Events here
+   *  are therefore metadata-only by default — no req_body_sample_b64 /
+   *  req_body_sample_path (gzipped prompt bodies captured on 4xx), no
+   *  error_body (upstream 4xx bodies can quote prompt content back), and no
+   *  cwd / git_branch / os_version (identify the caller's machine). Counts,
+   *  durations, usage, and sha256 prefixes still flow. */
   PXPIPE_TRACK?: string;
+  /** Explicit opt-in ("1"/"true") to include the sensitive fields above in
+   *  Workers Logs events. Only enable if you accept that prompt content can
+   *  land in Cloudflare's log pipeline on 4xx errors. Default-off. */
+  PXPIPE_TRACK_BODY_SAMPLES?: string;
   /** Shared secret callers must present via the `x-pxpipe-secret` header
    *  whenever an API-key override is configured. Without this gate a
    *  discovered workers.dev URL is an open key-spender: the Worker would
@@ -118,6 +129,10 @@ export default {
     // per event so downstream (Logpush → R2/S3) reads the same JSONL shape
     // the Node host writes to disk.
     const tracker: Tracker = trackingOn ? new JsonLogTracker((s) => console.log(s)) : noopTracker;
+    // Metadata-only unless the operator explicitly opts in: everything logged
+    // here leaves the machine (Cloudflare Workers Logs), and 4xx events would
+    // otherwise carry the full transformed prompt body. See Env docs above.
+    const trackSensitive = truthy(env.PXPIPE_TRACK_BODY_SAMPLES, false);
 
     const sharedUpstream = env.PXPIPE_UPSTREAM;
     const config: ProxyConfig = {
@@ -141,7 +156,7 @@ export default {
           );
         }
 
-        tracker.emit(toTrackEvent(e));
+        tracker.emit(toTrackEvent(e, { sensitive: trackSensitive }));
       },
     };
     const handle = createProxy(config);

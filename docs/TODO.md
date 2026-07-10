@@ -16,8 +16,8 @@ top-to-bottom; check items off and commit per item.
 
 ## P0 — Correctness, privacy, security (do first)
 
-- [ ] **1. Fail closed on provider-prefixed passthrough** — stop the OpenAI-credential-to-Anthropic leak; 502 before touching headers/body when `config.provider !== 'cloudflare-ai-gateway'`; regression test. (IMPROVEMENT_PLAN §1)
-- [ ] **2. Stop the Cloudflare Worker shipping transformed prompt bodies off-machine** — default `PXPIPE_TRACK` to metadata-only; README/worker.ts carve-out. (§2)
+- [x] **1. Fail closed on provider-prefixed passthrough** — done `f649de8`: 502 + zero outbound fetches in default config; explicit ocproxy upstream / gateway mode preserved. (IMPROVEMENT_PLAN §1)
+- [x] **2. Stop the Cloudflare Worker shipping transformed prompt bodies off-machine** — done: Worker track events are metadata-only by default (`req_body_sample_b64`, error bodies, `cwd`/`git_branch`/`os_version` stripped); opt back in via `PXPIPE_TRACK_BODY_SAMPLES=1`; README carve-out added. (§2)
 - [ ] **3. Fix baseline.ts honesty bugs** — 1h cache-create rate and probe-miss savings collapse. (§3)
 - [ ] **4. Verify gpt-5.6 vision profile; lock model scope to vetted exact ids** — drop the `startsWith` alias. (§4)
 - [ ] **9. Dashboard CSRF protection** on state-changing endpoints — shared-secret header or strict Origin check; JSON-only. (§9)

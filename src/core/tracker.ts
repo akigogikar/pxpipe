@@ -1,7 +1,11 @@
 /**
  * Runtime-agnostic event sink for pxpipe.
  * Per-request JSONL record — same shape on Node (file) and Workers (console.log).
- * Never emits raw text; only sizes, counts, durations, env fields, and sha256 prefixes.
+ * Mostly sizes, counts, durations, and sha256 prefixes — BUT on 4xx the event
+ * can carry raw request text (req_body_sample_b64 / error_body) and client env
+ * fields (cwd, git_branch, os_version). Sinks that leave the machine (Workers
+ * Logs) must pass `{ sensitive: false }` to toTrackEvent unless the operator
+ * explicitly opts in.
  */
 
 import type { ProxyEvent } from './proxy.js';
@@ -162,8 +166,23 @@ export interface Tracker {
   flush?(): void | Promise<void>;
 }
 
+/** Controls which sensitive fields toTrackEvent may emit. */
+export interface TrackEventOptions {
+  /**
+   * When false, omit fields that can carry raw prompt text or identify the
+   * caller's machine: req_body_sample_b64, req_body_sample_path, error_body,
+   * cwd, git_branch, os_version. Non-reversible sha256 prefixes
+   * (req_body_sha8 etc.) are kept — they correlate without disclosing.
+   * Defaults to true (Node host, on-disk sink). The Worker's console.log
+   * sink ships to Cloudflare Workers Logs — off-machine — so it passes
+   * false unless the operator sets PXPIPE_TRACK_BODY_SAMPLES.
+   */
+  sensitive?: boolean;
+}
+
 /** Convert a ProxyEvent to its flat persisted shape. Shared in core so Node/Worker hosts stay in sync. */
-export function toTrackEvent(ev: ProxyEvent): TrackEvent {
+export function toTrackEvent(ev: ProxyEvent, opts: TrackEventOptions = {}): TrackEvent {
+  const sensitive = opts.sensitive !== false;
   const info = ev.info;
   const env = info?.env;
   const u = ev.usage;
@@ -177,15 +196,19 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (ev.model) out.model = ev.model;
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
   if (ev.error) out.error = ev.error;
-  if (ev.errorBody) out.error_body = ev.errorBody;
+  // error_body echoes the upstream 4xx response, which can quote request
+  // (prompt) content back — sensitive-gated alongside the body sample.
+  if (ev.errorBody && sensitive) out.error_body = ev.errorBody;
   if (ev.reqBodySha8) out.req_body_sha8 = ev.reqBodySha8;
   // Body sample: sidecar path (Node) > inline base64 if it fits > drop (Workers, oversized).
-  if (ev.reqBodySamplePath) {
-    out.req_body_sample_path = ev.reqBodySamplePath;
-  } else if (ev.reqBodyGz && ev.reqBodyGz.byteLength > 0) {
-    const b64 = bytesToBase64(ev.reqBodyGz);
-    if (b64.length <= TRACK_BODY_INLINE_MAX) {
-      out.req_body_sample_b64 = b64;
+  if (sensitive) {
+    if (ev.reqBodySamplePath) {
+      out.req_body_sample_path = ev.reqBodySamplePath;
+    } else if (ev.reqBodyGz && ev.reqBodyGz.byteLength > 0) {
+      const b64 = bytesToBase64(ev.reqBodyGz);
+      if (b64.length <= TRACK_BODY_INLINE_MAX) {
+        out.req_body_sample_b64 = b64;
+      }
     }
   }
 
@@ -279,11 +302,13 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
   }
   if (env) {
-    if (env.cwd) out.cwd = env.cwd;
+    // cwd / git_branch / os_version identify the caller's machine and project —
+    // sensitive-gated. platform ("darwin") and today are coarse enough to keep.
+    if (env.cwd && sensitive) out.cwd = env.cwd;
     if (env.isGitRepo !== undefined) out.is_git_repo = env.isGitRepo;
-    if (env.gitBranch) out.git_branch = env.gitBranch;
+    if (env.gitBranch && sensitive) out.git_branch = env.gitBranch;
     if (env.platform) out.platform = env.platform;
-    if (env.osVersion) out.os_version = env.osVersion;
+    if (env.osVersion && sensitive) out.os_version = env.osVersion;
     if (env.today) out.today = env.today;
   }
   if (u) {
