@@ -43,6 +43,25 @@ export interface StatsPayload {
   events_with_measurement: number;
   uptime_sec_unused?: never; // future-proof
   compression_enabled: boolean;
+  /** Per-model-family rollup — folded from the SAME eff-token accumulators as
+   *  the headline totals, so the rows sum to the lifetime numbers. Sorted by
+   *  paid input, descending. Optional for back-compat with older payloads. */
+  by_model?: ModelStatsRow[];
+}
+
+/** One row of `StatsPayload.by_model`. `model` is the family id: `[variant]`
+ *  tags and a trailing `-YYYYMMDD` release stamp are stripped so dated
+ *  releases and bracket variants fold into one row. */
+export interface ModelStatsRow {
+  model: string;
+  requests: number;
+  compressed: number;
+  baseline_input_weighted: number;
+  actual_input_weighted: number;
+  saved_input_tokens: number;
+  saved_pct: number;
+  all_actual_input_weighted: number;
+  output_weighted: number;
 }
 
 export interface PricingAssumptions {

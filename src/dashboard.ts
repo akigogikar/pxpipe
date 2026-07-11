@@ -62,6 +62,7 @@ import {
   renderContextMapFragment,
   renderSessionSummaryFragment,
   renderHeaderFragment,
+  renderByModelFragment,
   renderRecentFragment,
   renderLatestFragment,
   renderSessionsFragment,
@@ -413,6 +414,16 @@ function gptEff(args: {
 
 export class DashboardState {
   private recent: RecentRow[] = [];
+  /** Per-model-family rollup for the dashboard's "By model" panel. Folded in
+   *  update() from the SAME eff-token locals as `totals`, so the families
+   *  always sum to the headline — and, like `totals`, intentionally NOT
+   *  restored by replay() (the file may have rotated; double-counting is
+   *  worse than starting fresh). Keyed by modelFamily(). */
+  private byModel: Map<string, {
+    requests: number; compressed: number;
+    baselineInputWeighted: number; actualInputWeighted: number;
+    allActualInputWeighted: number; outputWeighted: number;
+  }> = new Map();
   /** Per-session dollar-weighted totals, keyed by `info.firstUserSha8`. The
    *  dashboard surfaces ONLY the most-recently-active session via the
    *  `serveCurrentSessionJson` endpoint — older sessions linger in the Map
@@ -506,6 +517,18 @@ export class DashboardState {
     this.paths = paths;
     this.ccMapFn = ccMapFn ?? (() => claudeCodeMap());
   }
+
+  /** Collapse a model id to its family for the by-model rollup: `[variant]`
+   *  tags and a trailing `-YYYYMMDD` release stamp are stripped so dated
+   *  releases and bracket variants fold into one row (mirrors applicability's
+   *  base-prefix matching). Empty/absent ids bucket as 'unknown'. */
+  private static modelFamily(model: string | null | undefined): string {
+    if (typeof model !== 'string') return 'unknown';
+    const fam = model.replace(/\[[^\]]*\]/g, '').replace(/-20\d{6}$/, '').trim();
+    return fam || 'unknown';
+  }
+  /** Hard cap on byModel families — bounds memory against junk model ids. */
+  private static readonly BY_MODEL_CAP = 50;
 
   /** Stash every rendered image into the ring (called from onRequest with the
    *  raw ProxyEvent before info.firstImagePng is dropped by toTrackEvent).
@@ -786,6 +809,37 @@ export class DashboardState {
       }
     }
 
+    // Per-model-family rollup for the "By model" panel. Reuses the SAME
+    // haveUsage / creditSaving guards and eff-token locals as the totals fold
+    // above, so the family rows always sum to the headline numbers.
+    {
+      const fam = DashboardState.modelFamily(ev.model);
+      let m = this.byModel.get(fam);
+      if (!m) {
+        m = {
+          requests: 0, compressed: 0,
+          baselineInputWeighted: 0, actualInputWeighted: 0,
+          allActualInputWeighted: 0, outputWeighted: 0,
+        };
+        this.byModel.set(fam, m);
+        // Evict the oldest family past the cap (insertion order).
+        if (this.byModel.size > DashboardState.BY_MODEL_CAP) {
+          const firstKey = this.byModel.keys().next().value;
+          if (firstKey !== undefined) this.byModel.delete(firstKey);
+        }
+      }
+      m.requests += 1;
+      if (compressed) m.compressed += 1;
+      if (creditSaving) {
+        m.baselineInputWeighted += baselineInputEff;
+        m.actualInputWeighted += actualInputEff;
+      }
+      if (haveUsage) {
+        m.allActualInputWeighted += actualInputEff;
+        m.outputWeighted += outputEquiv;
+      }
+    }
+
     // Per-session aggregation. Uses the SAME baseline/actual/output math as
     // the global accumulators above, partitioned by `info.firstUserSha8`
     // so the dashboard's "current session" panel can show what's happening
@@ -880,10 +934,8 @@ export class DashboardState {
   }
 
 
-  /** On startup, fold the last N entries from the JSONL events file back
-   *  into the ring buffer so a process restart doesn't show an empty table.
-   *  Cumulative totals are *not* restored (the file may have rotated, and
-   *  double-counting is worse than starting fresh). */
+  /** On startup, fold the persisted JSONL events back into cumulative totals
+   *  while keeping only the last N rows in the in-memory recent ring. */
   async replay(filePath: string): Promise<void> {
     try {
       await fs.promises.access(filePath, fs.constants.R_OK);
@@ -892,20 +944,17 @@ export class DashboardState {
     }
     const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    const tail: TrackEvent[] = [];
     for await (const line of rl) {
       if (!line) continue;
+      let t: TrackEvent;
       try {
-        const ev = JSON.parse(line) as TrackEvent;
-        tail.push(ev);
-        if (tail.length > RECENT_CAP) tail.shift();
+        t = JSON.parse(line) as TrackEvent;
       } catch {
-        /* skip malformed line */
+        continue; // skip malformed line
       }
-    }
-    // Replay mirrors the live update() warmth logic (per-session baselineWarmth,
-    // cr-grounded) so it produces byte-identical per-row numbers to update().
-    for (const t of tail) {
+
+      // Replay mirrors the live update() warmth logic (per-session baselineWarmth,
+      // cr-grounded) so it produces byte-identical per-row numbers to update().
       const inp = t.input_tokens ?? 0;
       const out = t.output_tokens ?? 0;
       const cc = t.cache_create_tokens ?? 0;
@@ -920,6 +969,7 @@ export class DashboardState {
       let creditSaving: boolean;
       let actualInputEff: number;
       let baselineInputEff: number;
+      let outputEquiv: number;
       let rawActual: number;
       let rawBaseline: number;
       let baselineForRow: number;
@@ -942,6 +992,7 @@ export class DashboardState {
         creditSaving = e.creditSaving;
         actualInputEff = e.actualInputEff;
         baselineInputEff = e.baselineInputEff;
+        outputEquiv = e.outputEquiv;
         rawActual = e.rawActual;
         rawBaseline = e.rawBaseline;
         baselineForRow = e.rawBaseline;
@@ -1006,6 +1057,7 @@ export class DashboardState {
         }
         rawActual = inp + cc + cr;
         rawBaseline = baseline ?? 0;
+        outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
         baselineForRow = baseline ?? 0;
         cacheReadForRow = cr;
         warmForRow = warmR; // server-observed cache read
@@ -1039,6 +1091,105 @@ export class DashboardState {
           this.contextHistory.splice(0, this.contextHistory.length - RECENT_CAP);
         }
       }
+
+      this.totals.requests += 1;
+      if (compressed) this.totals.compressedRequests += 1;
+      if (creditSaving) {
+        this.totals.baselineInputWeighted += baselineInputEff;
+        this.totals.actualInputWeighted += actualInputEff;
+        this.totals.outputWeighted += outputEquiv;
+      }
+      if (haveUsage) {
+        this.totals.allBaselineEquivalentWeighted += baselineInputEff;
+        this.totals.allActualInputWeighted += actualInputEff;
+        this.totals.allOutputWeighted += outputEquiv;
+        this.totals.allUsageRequests += 1;
+        if (compressed) {
+          this.totals.compressedPaidRequests += 1;
+          this.totals.compressedActualInputWeighted += actualInputEff;
+          this.totals.compressedOutputWeighted += outputEquiv;
+        } else {
+          this.totals.passthroughPaidRequests += 1;
+          this.totals.passthroughActualInputWeighted += actualInputEff;
+          this.totals.passthroughOutputWeighted += outputEquiv;
+        }
+      }
+
+      const fam = DashboardState.modelFamily(t.model);
+      let modelTotals = this.byModel.get(fam);
+      if (!modelTotals) {
+        modelTotals = {
+          requests: 0, compressed: 0,
+          baselineInputWeighted: 0, actualInputWeighted: 0,
+          allActualInputWeighted: 0, outputWeighted: 0,
+        };
+        this.byModel.set(fam, modelTotals);
+        if (this.byModel.size > DashboardState.BY_MODEL_CAP) {
+          const firstKey = this.byModel.keys().next().value;
+          if (firstKey !== undefined) this.byModel.delete(firstKey);
+        }
+      }
+      modelTotals.requests += 1;
+      if (compressed) modelTotals.compressed += 1;
+      if (creditSaving) {
+        modelTotals.baselineInputWeighted += baselineInputEff;
+        modelTotals.actualInputWeighted += actualInputEff;
+      }
+      if (haveUsage) {
+        modelTotals.allActualInputWeighted += actualInputEff;
+        modelTotals.outputWeighted += outputEquiv;
+      }
+
+      const sid = (t as { first_user_sha8?: string }).first_user_sha8;
+      if (typeof sid === 'string' && sid.length > 0) {
+        this.currentSessionId = sid;
+        let sessionTotals = this.sessions.get(sid);
+        if (!sessionTotals) {
+          sessionTotals = {
+            sessionId: sid,
+            baselineInputWeighted: 0,
+            actualInputWeighted: 0,
+            baselineMeasuredCount: 0,
+            allActualInputWeighted: 0,
+            allOutputWeighted: 0,
+            rawActualTokens: 0,
+            rawBaselineTokens: 0,
+            rawOutputTokens: 0,
+          };
+          this.sessions.set(sid, sessionTotals);
+          if (this.sessions.size > DashboardState.SESSION_CAP) {
+            const firstKey = this.sessions.keys().next().value;
+            if (firstKey !== undefined) this.sessions.delete(firstKey);
+          }
+        }
+        if (creditSaving) {
+          sessionTotals.baselineInputWeighted += baselineInputEff;
+          sessionTotals.actualInputWeighted += actualInputEff;
+          sessionTotals.baselineMeasuredCount += 1;
+          sessionTotals.rawActualTokens += rawActual;
+          sessionTotals.rawBaselineTokens += rawBaseline;
+          sessionTotals.rawOutputTokens += out;
+        }
+        if (haveUsage) {
+          sessionTotals.allActualInputWeighted += actualInputEff;
+          sessionTotals.allOutputWeighted += outputEquiv;
+        }
+      }
+
+      const measured = {
+        text: (t as { text_chars_measured?: number }).text_chars_measured,
+        thinking: (t as { thinking_chars_measured?: number }).thinking_chars_measured,
+        toolUse: (t as { tool_use_chars_measured?: number }).tool_use_chars_measured,
+        redacted: (t as { redacted_block_count_measured?: number }).redacted_block_count_measured,
+      };
+      if (Object.values(measured).some((value) => value !== undefined)) {
+        this.totals.textCharsMeasured += measured.text ?? 0;
+        this.totals.thinkingCharsMeasured += measured.thinking ?? 0;
+        this.totals.toolUseCharsMeasured += measured.toolUse ?? 0;
+        this.totals.redactedBlockCountMeasured += measured.redacted ?? 0;
+        this.totals.eventsWithMeasurement += 1;
+      }
+
       const row: RecentRow = {
         ts: Date.parse(t.ts) / 1000,
         method: t.method,
@@ -1060,6 +1211,9 @@ export class DashboardState {
         img_ids: imgId !== undefined ? [imgId] : undefined,
       };
       this.recent.push(row);
+      if (this.recent.length > RECENT_CAP) {
+        this.recent.splice(0, this.recent.length - RECENT_CAP);
+      }
     }
   }
 
@@ -1215,6 +1369,25 @@ export class DashboardState {
       all_actual_input_weighted: Math.round(allActual),
       all_output_weighted: Math.round(allOutput),
       all_usage_requests: this.totals.allUsageRequests,
+      // Per-model-family rollup — same eff-token accumulators as the totals
+      // above, so the family rows sum to the headline. Sorted by paid input.
+      by_model: [...this.byModel.entries()]
+        .map(([model, m]) => ({
+          model,
+          requests: m.requests,
+          compressed: m.compressed,
+          baseline_input_weighted: Math.round(m.baselineInputWeighted),
+          actual_input_weighted: Math.round(m.actualInputWeighted),
+          saved_input_tokens: Math.round(m.baselineInputWeighted - m.actualInputWeighted),
+          saved_pct: round1(
+            m.baselineInputWeighted > 0
+              ? ((m.baselineInputWeighted - m.actualInputWeighted) / m.baselineInputWeighted) * 100
+              : 0,
+          ),
+          all_actual_input_weighted: Math.round(m.allActualInputWeighted),
+          output_weighted: Math.round(m.outputWeighted),
+        }))
+        .sort((a, b) => b.all_actual_input_weighted - a.all_actual_input_weighted),
       // Direct observed split — replaces "share of spend saved" as the
       // headline. Total actual $ and average $/req per path, plus a delta
       // gated on `split_sufficient_sample`. No counterfactual: each
@@ -1357,6 +1530,14 @@ export class DashboardState {
       case 'header': {
         const s = (await this.serveStats().json()) as StatsPayload;
         return htmlResponse(renderHeaderFragment(s, port));
+      }
+      case 'by-model': {
+        // Same payload pair as header + recent, so this panel can't drift
+        // from either surface: totals give the per-family rows, the recent
+        // ring gives the savings-trend sparkline.
+        const s = (await this.serveStats().json()) as StatsPayload;
+        const r = (await this.serveRecent().json()) as RecentPayload;
+        return htmlResponse(renderByModelFragment(s, r));
       }
       case 'recent': {
         const r = (await this.serveRecent().json()) as RecentPayload;

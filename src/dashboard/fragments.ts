@@ -86,8 +86,16 @@ const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
 
 const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'gpt-5.6', label: 'GPT 5.6' },
+  { id: 'gpt-5.6-mini', label: 'GPT 5.6 Mini' },
+  { id: 'gpt-5.6-nano', label: 'GPT 5.6 Nano' },
   { id: 'gpt-5.5', label: 'GPT 5.5' },
 ];
+
+/** Shared id → cosmetic label map — the model chips and the by-model table
+ *  read one source so a rename can't drift between panels. */
+const MODEL_LABELS = new Map<string, string>(
+  [...MODEL_CATALOG, ...GPT_MODEL_CATALOG].map((m) => [m.id, m.label]),
+);
 
 export function renderModelsFragment(
   active: string[],
@@ -95,9 +103,6 @@ export function renderModelsFragment(
   enabled: boolean,
 ): string {
   const on = new Set(active);
-  const labelOf = new Map(
-    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG].map((m) => [m.id, m.label]),
-  );
   // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
   // families always show as toggles, then split by family for the two sections.
   const ids: string[] = [];
@@ -115,7 +120,7 @@ export function renderModelsFragment(
   }
   const chipFor = (id: string): string => {
     const lit = on.has(id);
-    const label = labelOf.get(id) ?? id;
+    const label = MODEL_LABELS.get(id) ?? id;
     return (
       `<button class="chip${lit ? ' on' : ''}" type="button" ` +
       `hx-post="/fragments/models" hx-target="#frag-models" ` +
@@ -131,11 +136,91 @@ export function renderModelsFragment(
     claudeChips +
     `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS</span>${moot}` +
     `</div>` +
-    `<div class="models" style="display:none">` +
+    `<div class="models">` +
     `<span class="models-label">Image GPT models</span>` +
     gptChips +
-    `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +
+    `<span class="hint">GPT 5.6 covers all 5.6 variants · imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +
     `</div>`
+  );
+}
+
+// ---- by-model rollup + savings trend --------------------------------------
+
+/** Inline-SVG sparkline of saved-% per measured request over the recent ring
+ *  (oldest left, newest right). Server-rendered like every other fragment —
+ *  no client JS. The ring caps at 50, so this is a recent-window trend, not
+ *  lifetime history. */
+function savingsSparkline(rows: RecentRow[]): string {
+  const pts = rows
+    .filter((r) =>
+      typeof r.baseline_input === 'number' && r.baseline_input > 0 &&
+      typeof r.actual_input === 'number')
+    .map((r) => Math.max(0, Math.min(100,
+      (((r.baseline_input as number) - (r.actual_input as number)) /
+        (r.baseline_input as number)) * 100)));
+  if (pts.length < 2) {
+    return `<span class="hint">trend appears after two measured requests</span>`;
+  }
+  const W = 280, H = 44, P = 3;
+  const x = (i: number): number => P + (i * (W - 2 * P)) / (pts.length - 1);
+  const y = (v: number): number => H - P - (v / 100) * (H - 2 * P);
+  const line = pts.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  const area = `${P},${H - P} ${line} ${W - P},${H - P}`;
+  const last = pts[pts.length - 1] as number;
+  return (
+    `<svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" ` +
+    `aria-label="saved percent per measured request, oldest to newest">` +
+    `<polygon class="spark-area" points="${area}"></polygon>` +
+    `<polyline class="spark-line" fill="none" points="${line}"></polyline>` +
+    `<circle class="spark-dot" cx="${x(pts.length - 1).toFixed(1)}" cy="${y(last).toFixed(1)}" r="2.5"></circle>` +
+    `</svg>` +
+    `<span class="spark-last">${last.toFixed(0)}%<span class="hint"> latest</span></span>`
+  );
+}
+
+/** "By model" panel: per-family savings table + recent savings trend. Reads
+ *  the same StatsPayload accumulators as the header (families sum to the
+ *  headline) and the same recent ring as the requests table. */
+export function renderByModelFragment(s: StatsPayload, r: RecentPayload): string {
+  const recent = r.recent ?? [];
+  const measuredRecent = recent.filter(
+    (row) => typeof row.baseline_input === 'number' && row.baseline_input > 0,
+  ).length;
+  const trend =
+    `<div class="spark-wrap"><span class="models-label">Savings trend</span>` +
+    savingsSparkline(recent) +
+    `<span class="hint">saved % per measured request · ${measuredRecent} of last ${recent.length}</span></div>`;
+  const rows = s.by_model ?? [];
+  if (rows.length === 0) {
+    return trend +
+      `<div class="status">no traffic yet — per-model rows appear with the first proxied request</div>`;
+  }
+  const dash = `<span class="muted">–</span>`;
+  const body = rows.map((m) => {
+    const measured = m.baseline_input_weighted > 0;
+    const cls = m.saved_input_tokens > 0 ? 'good' : m.saved_input_tokens < 0 ? 'bad' : 'muted';
+    const label = MODEL_LABELS.get(m.model);
+    const nameCell = label
+      ? `${escapeHtml(label)}<span class="hint mono-sub">${escapeHtml(m.model)}</span>`
+      : escapeHtml(m.model);
+    return (
+      `<tr>` +
+      `<td>${nameCell}</td>` +
+      `<td class="num">${numFmt(m.requests)}</td>` +
+      `<td class="num">${numFmt(m.compressed)}</td>` +
+      `<td class="num">${kFmt(m.all_actual_input_weighted)}</td>` +
+      `<td class="num ${cls}">${measured ? kFmt(m.saved_input_tokens) : dash}</td>` +
+      `<td class="num ${cls}">${measured ? `${m.saved_pct.toFixed(1)}%` : dash}</td>` +
+      `</tr>`
+    );
+  }).join('');
+  return (
+    trend +
+    `<table class="dtable bymodel"><thead><tr>` +
+    `<th>model</th><th class="num">requests</th><th class="num">imaged</th>` +
+    `<th class="num">input paid</th><th class="num">saved</th><th class="num">saved %</th>` +
+    `</tr></thead><tbody>${body}</tbody></table>` +
+    `<div class="hint">cache-weighted input tokens · saved counts measured (imaged) rows only · dated releases fold into one family</div>`
   );
 }
 
@@ -1032,6 +1117,23 @@ const THEME_JS = `
   })();
 `;
 
+// CSS for the by-model panel + sparkline lives with the rest of the styles;
+// appended via string concat so the big template above stays untouched.
+const BY_MODEL_CSS = `
+  /* by-model rollup + sparkline */
+  .spark-wrap { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }
+  .spark { display: block; }
+  .spark-line { stroke: var(--flame); stroke-width: 1.5; }
+  .spark-area { fill: var(--flame-tint); }
+  .spark-dot { fill: var(--flame-strong); }
+  .spark-last { font-size: 12px; font-weight: 700; color: var(--ink); }
+  .bymodel th { text-align: left; color: var(--muted); font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .04em; padding: 4px 8px;
+    border-bottom: 1px solid var(--border); }
+  .bymodel th.num { text-align: right; }
+  .mono-sub { display: block; font-family: var(--mono); font-size: 10px; }
+`;
+
 export function renderPage(port: number): string {
   // hx-trigger="load, every Ns": paint on load then poll (2s live, 5s aggregates).
   return `<!doctype html>
@@ -1041,7 +1143,7 @@ export function renderPage(port: number): string {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>pxpipe — live dashboard</title>
 <link rel="icon" href="${FAVICON}" />
-<style>${CSS}</style>
+<style>${CSS}${BY_MODEL_CSS}</style>
 <script>
   // Set theme before first paint (no flash): saved choice wins, else system preference.
   (function () {
@@ -1076,6 +1178,13 @@ export function renderPage(port: number): string {
 </div>
 
 <div id="frag-header" hx-get="/fragments/header" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+
+<section class="section">
+  <h2 class="section-head">By model <span class="section-sub">where the savings come from</span></h2>
+  <div class="card">
+    <div id="frag-by-model" hx-get="/fragments/by-model" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+  </div>
+</section>
 
 <section class="section">
   <h2 class="section-head">What happened to your context <span class="section-sub">click a request to see image vs text</span></h2>

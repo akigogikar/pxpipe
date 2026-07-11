@@ -154,6 +154,31 @@ describe('serveApiStats', () => {
   });
 });
 
+describe('dashboard restart replay', () => {
+  it('restores all cumulative totals while bounding the recent ring', async () => {
+    const events = Array.from({ length: 55 }, (_, i) => ev({
+      ts: new Date(Date.parse('2026-05-19T00:00:00Z') + i * 1000).toISOString(),
+      model: 'claude-fable-5',
+      compressed: i % 2 === 0,
+      input_tokens: 100,
+      output_tokens: 10,
+      first_user_sha8: 'restart-session',
+    }));
+    writeEvents(tmp, events);
+
+    await dash.replay(tmp.eventsFile);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    expect(stats.requests).toBe(55);
+    expect(stats.compressed_requests).toBe(28);
+    expect(stats.by_model).toEqual([
+      expect.objectContaining({ model: 'claude-fable-5', requests: 55, compressed: 28 }),
+    ]);
+    expect(recent.recent).toHaveLength(50);
+  });
+});
+
 // ---- /fragments/* (htmx server-rendered HTML) ------------------------
 
 describe('serveFragment', () => {
@@ -581,5 +606,106 @@ describe('server-observed warmth: text follows actual cache_read', () => {
     expect(row.baseline_input).toBe(12000);
     expect(row.baseline_input).not.toBe(35000); // the inflated cold-priced bug value
     expect(row.session_saved_so_far_delta).toBe(9900);
+  });
+});
+
+// The "By model" panel folds a per-family rollup from the SAME eff-token
+// accumulators as the headline totals. These lock the invariant that families
+// sum to the headline, plus the id → family collapsing (dated releases +
+// bracket variants), the paid-input sort, and the unknown bucket.
+describe('by_model rollup', () => {
+  // A compressed GPT turn: actual 8200, baseline 12400, saved 4200 (same math
+  // as the "GPT savings split" suite above).
+  const gptTurn = {
+    method: 'POST',
+    path: '/openai/responses',
+    model: 'gpt-5.6',
+    status: 200,
+    durationMs: 100,
+    usage: { input_tokens: 10000, output_tokens: 200, cached_tokens: 2000 },
+    info: {
+      compressed: true,
+      imageTokens: 8000,
+      baselineImagedTokens: 50000,
+      imageCount: 1,
+      firstUserSha8: 'bmsess1',
+    },
+  };
+
+  it('folds families that sum to the headline totals', async () => {
+    dash.update(structuredClone(gptTurn) as never);
+    dash.update({
+      ...structuredClone(gptTurn),
+      model: 'claude-sonnet-4-6',
+      path: '/v1/messages',
+      info: { ...structuredClone(gptTurn.info), firstUserSha8: 'bmsess2' },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    const rows = stats.by_model!;
+    expect(rows.map((r) => r.model).sort()).toEqual(['claude-sonnet-4-6', 'gpt-5.6']);
+
+    // Families sum to the headline — the whole point of folding from shared
+    // accumulators rather than a second independent pass.
+    const sum = (k: keyof (typeof rows)[number]) =>
+      rows.reduce((a, r) => a + (r[k] as number), 0);
+    expect(sum('requests')).toBe(stats.requests);
+    // creditSaving-gated columns fold to the measured headline …
+    expect(sum('saved_input_tokens')).toBe(stats.saved_input_tokens);
+    expect(sum('actual_input_weighted')).toBe(stats.actual_input_weighted);
+    expect(sum('baseline_input_weighted')).toBe(stats.baseline_input_weighted);
+    // … while the haveUsage-gated "input paid" column folds to the all-rows
+    // headline (a distinct accumulator — the two differ on passthrough rows).
+    expect(sum('all_actual_input_weighted')).toBe(stats.all_actual_input_weighted);
+
+    const gpt = rows.find((r) => r.model === 'gpt-5.6')!;
+    expect(gpt.requests).toBe(1);
+    expect(gpt.compressed).toBe(1);
+    expect(gpt.saved_input_tokens).toBe(4200);
+    expect(gpt.saved_pct).toBeCloseTo((4200 / 12400) * 100, 1);
+  });
+
+  it('folds dated releases and bracket variants into one family', async () => {
+    dash.update({
+      ...structuredClone(gptTurn),
+      model: 'gpt-5.6-20260101',
+      info: { ...structuredClone(gptTurn.info), firstUserSha8: 'bmdate1' },
+    } as never);
+    dash.update({
+      ...structuredClone(gptTurn),
+      model: 'gpt-5.6[thinking]',
+      info: { ...structuredClone(gptTurn.info), firstUserSha8: 'bmdate2' },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    const rows = stats.by_model!;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].model).toBe('gpt-5.6');
+    expect(rows[0].requests).toBe(2);
+    expect(rows[0].saved_input_tokens).toBe(8400);
+  });
+
+  it('sorts families by paid input descending and buckets a missing id as unknown', async () => {
+    // Big spender with no model id → 'unknown', ordered ahead of the small GPT.
+    dash.update({
+      ...structuredClone(gptTurn),
+      model: undefined,
+      usage: { input_tokens: 100000, output_tokens: 200, cached_tokens: 0 },
+      info: {
+        compressed: false,
+        imageTokens: 0,
+        baselineImagedTokens: 0,
+        firstUserSha8: 'bmunk',
+      },
+    } as never);
+    dash.update(structuredClone(gptTurn) as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    const rows = stats.by_model!;
+    expect(rows.map((r) => r.model)).toEqual(['unknown', 'gpt-5.6']);
+    // The unknown passthrough row had no measured baseline ⇒ 0 saved, 0%.
+    const unk = rows[0];
+    expect(unk.saved_input_tokens).toBe(0);
+    expect(unk.saved_pct).toBe(0);
   });
 });
